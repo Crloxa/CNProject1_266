@@ -54,8 +54,14 @@ namespace ImgParse
 			gray = input.clone();
 		}
 
+		const int maxDim = std::max(input.cols, input.rows);
+		int blockSize = std::max(31, static_cast<int>(maxDim * 101.0 / 800.0));
+		if ((blockSize & 1) == 0)
+		{
+			++blockSize;
+		}
 		Mat binary;
-		adaptiveThreshold(gray, binary, 255, ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY_INV, 101, 15);
+		adaptiveThreshold(gray, binary, 255, ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY_INV, blockSize, 15);
 		Mat kernel = getStructuringElement(MORPH_CROSS, Size(2, 2));
 		Mat closedBinary;
 		morphologyEx(binary, closedBinary, MORPH_CLOSE, kernel);
@@ -64,6 +70,7 @@ namespace ImgParse
 		vector<Vec4i> hierarchy;
 		findContours(closedBinary, contours, hierarchy, RETR_TREE, CHAIN_APPROX_SIMPLE);
 
+		const float areaThreshold = std::max(120.0f, 500.0f * (maxDim / 800.0f) * (maxDim / 800.0f));
 		vector<Point3f> centers;
 		for (size_t i = 0; i < contours.size(); ++i)
 		{
@@ -81,20 +88,21 @@ namespace ImgParse
 			if (cnt >= 2)
 			{
 				Moments mu = moments(contours[i], false);
-				if (mu.m00 >= 500)
+				if (mu.m00 >= areaThreshold)
 				{
 					centers.push_back(Point3f(static_cast<float>(mu.m10 / mu.m00), static_cast<float>(mu.m01 / mu.m00), static_cast<float>(mu.m00)));
 				}
 			}
 		}
 
+		const float mergeDist = std::max(24.0f, 100.0f * (maxDim / 800.0f));
 		vector<Point3f> merged;
 		for (const auto& pt : centers)
 		{
 			bool isNew = true;
 			for (auto& m : merged)
 			{
-				if (norm(Point2f(pt.x, pt.y) - Point2f(m.x, m.y)) < 100.0)
+				if (norm(Point2f(pt.x, pt.y) - Point2f(m.x, m.y)) < mergeDist)
 				{
 					isNew = false;
 					if (pt.z > m.z)
@@ -127,6 +135,7 @@ namespace ImgParse
 			return false;
 		}
 
+		// 统一先缩放到约 800 像素工作尺度：降低噪声与计算量，同时稳定轮廓参数范围。
 		const float scale = 800.0f / static_cast<float>(std::max(srcImg.cols, srcImg.rows));
 		Mat smallImg;
 		resize(srcImg, smallImg, Size(), scale, scale, INTER_AREA);
@@ -154,6 +163,7 @@ namespace ImgParse
 
 		if (centers.size() > 4)
 		{
+			// 选取距离整体中心更远的 4 点，优先保留外层定位块，抑制中心附近伪候选点。
 			sort(centers.begin(), centers.end(), [&approxCenter](Point3f a, Point3f b)
 			{
 				return norm(Point2f(a.x, a.y) - approxCenter) > norm(Point2f(b.x, b.y) - approxCenter);
@@ -242,7 +252,7 @@ namespace ImgParse
 
 		const Mat transform = getPerspectiveTransform(src, dst);
 		Mat warped;
-		warpPerspective(srcColor, warped, transform, Size(outWidth, outHeight), INTER_NEAREST);
+		warpPerspective(srcColor, warped, transform, Size(outWidth, outHeight), INTER_LINEAR);
 
 		Mat warpedGray;
 		cvtColor(warped, warpedGray, COLOR_BGR2GRAY);
