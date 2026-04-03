@@ -14,7 +14,7 @@ namespace ImgParse
 	namespace
 	{
 		constexpr int kFrameSize = 266;
-		constexpr float kFinderCenter = 21.0f;                 // (42 - 1) / 2
+		constexpr float kFinderCenter = 21.0f;                 // aligned with current encoder finder-center mapping
 		constexpr float kOppositeFinderCenter = 245.0f;        // 266 - 21
 		constexpr int kThresholdBlockSize = 19;
 		constexpr int kThresholdBias = 10;
@@ -84,7 +84,11 @@ namespace ImgParse
 					const Moments mu = moments(contours[i], false);
 					if (mu.m00 >= minArea)
 					{
-						centers.push_back({ Point2f(static_cast<float>(mu.m10 / mu.m00), static_cast<float>(mu.m01 / mu.m00)), static_cast<float>(mu.m00) });
+						const Point2f markerCenter(
+							static_cast<float>(mu.m10 / mu.m00),
+							static_cast<float>(mu.m01 / mu.m00)
+						);
+						centers.push_back({ markerCenter, static_cast<float>(mu.m00) });
 					}
 				}
 			}
