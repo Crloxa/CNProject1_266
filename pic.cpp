@@ -34,6 +34,125 @@ namespace ImgParse
 		return maxIdx;
 	}
 
+	void blockwiseColorMaxAdaptiveThreshold(const Mat& imgColor, Mat& binImg, int blockSize = 19, int bias = 10)
+	{
+		const int h = imgColor.rows;
+		const int w = imgColor.cols;
+		const int nBlockY = (h + blockSize - 1) / blockSize;
+		const int nBlockX = (w + blockSize - 1) / blockSize;
+		vector<vector<int>> thresholds(nBlockY, vector<int>(nBlockX, 128));
+
+		for (int by = 0; by < nBlockY; ++by)
+		{
+			for (int bx = 0; bx < nBlockX; ++bx)
+			{
+				vector<int> samples;
+				const int y0 = by * blockSize;
+				const int y1 = std::min(y0 + blockSize, h);
+				const int x0 = bx * blockSize;
+				const int x1 = std::min(x0 + blockSize, w);
+				samples.reserve((y1 - y0) * (x1 - x0));
+				for (int y = y0; y < y1; ++y)
+				{
+					for (int x = x0; x < x1; ++x)
+					{
+						const Vec3b pix = imgColor.at<Vec3b>(y, x);
+						samples.push_back(std::max(pix[0], std::max(pix[1], pix[2])));
+					}
+				}
+				if (samples.empty())
+				{
+					continue;
+				}
+				std::sort(samples.begin(), samples.end());
+				const int n = static_cast<int>(samples.size());
+				const int lowIdx = n / 10;
+				const int highIdx = n - n / 10 - 1;
+				const int blackMax = samples[lowIdx];
+				const int whiteMin = samples[highIdx];
+				int t = (blackMax + whiteMin) / 2 + bias;
+				t = std::max(0, std::min(255, t));
+				thresholds[by][bx] = t;
+			}
+		}
+
+		binImg.create(h, w, CV_8UC3);
+		for (int y = 0; y < h; ++y)
+		{
+			const int by = y / blockSize;
+			for (int x = 0; x < w; ++x)
+			{
+				const int bx = x / blockSize;
+				const int t = thresholds[by][bx];
+				const Vec3b pix = imgColor.at<Vec3b>(y, x);
+				const int mx = std::max(pix[0], std::max(pix[1], pix[2]));
+				binImg.at<Vec3b>(y, x) = (mx > t) ? Vec3b(255, 255, 255) : Vec3b(0, 0, 0);
+			}
+		}
+	}
+
+	bool orderThreeMarkersAsTLTRBL(const vector<Point3f>& centers, Point2f& tl, Point2f& tr, Point2f& bl)
+	{
+		if (centers.size() != 3)
+		{
+			return false;
+		}
+		double maxDist = 0.0;
+		int rightAngleIdx = -1;
+		for (int i = 0; i < 3; ++i)
+		{
+			for (int j = i + 1; j < 3; ++j)
+			{
+				const double d = norm(Point2f(centers[i].x, centers[i].y) - Point2f(centers[j].x, centers[j].y));
+				if (d > maxDist)
+				{
+					maxDist = d;
+					rightAngleIdx = 3 - i - j;
+				}
+			}
+		}
+		if (rightAngleIdx < 0)
+		{
+			return false;
+		}
+
+		tl = Point2f(centers[rightAngleIdx].x, centers[rightAngleIdx].y);
+		const Point2f p1 = Point2f(centers[(rightAngleIdx + 1) % 3].x, centers[(rightAngleIdx + 1) % 3].y);
+		const Point2f p2 = Point2f(centers[(rightAngleIdx + 2) % 3].x, centers[(rightAngleIdx + 2) % 3].y);
+		const Point2f v1 = p1 - tl;
+		const Point2f v2 = p2 - tl;
+		const double len1 = norm(v1);
+		const double len2 = norm(v2);
+		if (len1 <= 1e-6 || len2 <= 1e-6)
+		{
+			return false;
+		}
+
+		const double legRatio = len1 / len2;
+		if (legRatio < 0.4 || legRatio > 2.5)
+		{
+			return false;
+		}
+		const double cosTheta = (v1.x * v2.x + v1.y * v2.y) / (len1 * len2);
+		if (std::abs(cosTheta) > 0.75)
+		{
+			return false;
+		}
+
+		const double cross = v1.x * v2.y - v1.y * v2.x;
+		if (cross > 0)
+		{
+			tr = p1;
+			bl = p2;
+		}
+		else
+		{
+			tr = p2;
+			bl = p1;
+		}
+		return true;
+	}
+
 	vector<Point3f> FindMarkerCenters(const Mat& input, int ch)
 	{
 		Mat gray;
@@ -55,7 +174,7 @@ namespace ImgParse
 		}
 
 		const int maxDim = std::max(input.cols, input.rows);
-		int blockSize = std::max(31, static_cast<int>(maxDim * 101.0 / 800.0));
+		int blockSize = std::max(31, static_cast<int>(maxDim * 31.0 / 1920.0));
 		if ((blockSize & 1) == 0)
 		{
 			++blockSize;
@@ -70,7 +189,7 @@ namespace ImgParse
 		vector<Vec4i> hierarchy;
 		findContours(closedBinary, contours, hierarchy, RETR_TREE, CHAIN_APPROX_SIMPLE);
 
-		const float areaThreshold = std::max(120.0f, 500.0f * (maxDim / 800.0f) * (maxDim / 800.0f));
+		const float areaThreshold = static_cast<float>(std::max(15.0, static_cast<double>(maxDim) * maxDim * 0.000004));
 		vector<Point3f> centers;
 		for (size_t i = 0; i < contours.size(); ++i)
 		{
@@ -95,7 +214,7 @@ namespace ImgParse
 			}
 		}
 
-		const float mergeDist = std::max(24.0f, 100.0f * (maxDim / 800.0f));
+		const float mergeDist = static_cast<float>(std::max(15.0, maxDim * 0.0078));
 		vector<Point3f> merged;
 		for (const auto& pt : centers)
 		{
@@ -135,7 +254,7 @@ namespace ImgParse
 			return false;
 		}
 
-		// 统一先缩放到约 800 像素工作尺度：降低噪声与计算量，同时稳定轮廓参数范围。
+		// 统一先缩放到约 800 像素工作尺度：降低噪声与计算量, 同时稳定轮廓参数范围。
 		const float scale = 800.0f / static_cast<float>(std::max(srcImg.cols, srcImg.rows));
 		Mat smallImg;
 		resize(srcImg, smallImg, Size(), scale, scale, INTER_AREA);
@@ -148,7 +267,7 @@ namespace ImgParse
 			centers.push_back(Point3f(pt.x / scale, pt.y / scale, pt.z));
 		}
 
-		if (centers.size() < 4)
+		if (centers.size() < 3)
 		{
 			return false;
 		}
@@ -171,72 +290,84 @@ namespace ImgParse
 			centers.resize(4);
 		}
 
-		Point2f exactCenter(0, 0);
-		for (const auto& p : centers)
+		Point2f tl, tr, br, bl;
+		if (centers.size() == 3)
 		{
-			exactCenter += Point2f(p.x, p.y);
-		}
-		exactCenter.x /= 4.0f;
-		exactCenter.y /= 4.0f;
-
-		int brIdx = -1;
-		float minRatio = 1e9f;
-		for (int i = 0; i < 4; ++i)
-		{
-			const float dist = norm(Point2f(centers[i].x, centers[i].y) - exactCenter);
-			if (dist <= 1e-6f)
+			if (!orderThreeMarkersAsTLTRBL(centers, tl, tr, bl))
 			{
-				continue;
+				return false;
 			}
-			const float area = centers[i].z;
-			const float ratio = area / (dist * dist);
-			if (ratio < minRatio)
+			br = tr + bl - tl;
+		}
+		else
+		{
+			Point2f exactCenter(0, 0);
+			for (const auto& p : centers)
 			{
-				minRatio = ratio;
-				brIdx = i;
+				exactCenter += Point2f(p.x, p.y);
 			}
-		}
-		if (brIdx < 0)
-		{
-			return false;
-		}
+			exactCenter.x /= 4.0f;
+			exactCenter.y /= 4.0f;
 
-		const Point2f brPoint(centers[brIdx].x, centers[brIdx].y);
-		vector<Point2f> sortedPts;
-		sortedPts.reserve(4);
-		for (const auto& p : centers)
-		{
-			sortedPts.push_back(Point2f(p.x, p.y));
-		}
-		sort(sortedPts.begin(), sortedPts.end(), [&exactCenter](Point2f a, Point2f b)
-		{
-			return atan2(a.y - exactCenter.y, a.x - exactCenter.x) < atan2(b.y - exactCenter.y, b.x - exactCenter.x);
-		});
-
-		int sortedBrIdx = 0;
-		for (int i = 0; i < 4; ++i)
-		{
-			if (norm(sortedPts[i] - brPoint) < 1.0f)
+			int brIdx = -1;
+			float minRatio = 1e9f;
+			for (int i = 0; i < 4; ++i)
 			{
-				sortedBrIdx = i;
-				break;
+				const float dist = norm(Point2f(centers[i].x, centers[i].y) - exactCenter);
+				if (dist <= 1e-6f)
+				{
+					continue;
+				}
+				const float area = centers[i].z;
+				const float ratio = area / (dist * dist);
+				if (ratio < minRatio)
+				{
+					minRatio = ratio;
+					brIdx = i;
+				}
 			}
-		}
+			if (brIdx < 0)
+			{
+				return false;
+			}
 
-		const Point2f br = sortedPts[sortedBrIdx];
-		const Point2f bl = sortedPts[(sortedBrIdx + 1) % 4];
-		const Point2f tl = sortedPts[(sortedBrIdx + 2) % 4];
-		const Point2f tr = sortedPts[(sortedBrIdx + 3) % 4];
+			const Point2f brPoint(centers[brIdx].x, centers[brIdx].y);
+			vector<Point2f> sortedPts;
+			sortedPts.reserve(4);
+			for (const auto& p : centers)
+			{
+				sortedPts.push_back(Point2f(p.x, p.y));
+			}
+			sort(sortedPts.begin(), sortedPts.end(), [&exactCenter](Point2f a, Point2f b)
+			{
+				return atan2(a.y - exactCenter.y, a.x - exactCenter.x) < atan2(b.y - exactCenter.y, b.x - exactCenter.x);
+			});
+
+			int sortedBrIdx = 0;
+			for (int i = 0; i < 4; ++i)
+			{
+				if (norm(sortedPts[i] - brPoint) < 1.0f)
+				{
+					sortedBrIdx = i;
+					break;
+				}
+			}
+			br = sortedPts[sortedBrIdx];
+			bl = sortedPts[(sortedBrIdx + 1) % 4];
+			tl = sortedPts[(sortedBrIdx + 2) % 4];
+			tr = sortedPts[(sortedBrIdx + 3) % 4];
+		}
 
 		const float padX = outWidth * 0.05225f;
 		const float padY = outHeight * 0.05225f;
-		const float correct = outWidth * 0.0160f;
+		// 对右下角单独补偿，延续 warp_engine 的经验参数以改善透视下的底边对齐。
+		const float brCornerCompensation = outWidth * 0.0160f;
 
 		const vector<Point2f> src = { tl, tr, br, bl };
 		const vector<Point2f> dst = {
 			Point2f(padX, padY),
 			Point2f(outWidth - 1 - padX, padY),
-			Point2f(outWidth - 1 - padX - correct, outHeight - 1 - padY - correct),
+			Point2f(outWidth - 1 - padX - brCornerCompensation, outHeight - 1 - padY - brCornerCompensation),
 			Point2f(padX, outHeight - 1 - padY)
 		};
 
@@ -254,11 +385,9 @@ namespace ImgParse
 		Mat warped;
 		warpPerspective(srcColor, warped, transform, Size(outWidth, outHeight), INTER_LINEAR);
 
-		Mat warpedGray;
-		cvtColor(warped, warpedGray, COLOR_BGR2GRAY);
 		Mat warpedBin;
-		threshold(warpedGray, warpedBin, 0, 255, THRESH_BINARY | THRESH_OTSU);
-		cvtColor(warpedBin, disImg, COLOR_GRAY2BGR);
+		blockwiseColorMaxAdaptiveThreshold(warped, warpedBin, 19, 10);
+		disImg = warpedBin;
 		return true;
 	}
 }
