@@ -10,6 +10,9 @@ namespace ImgParse
 	using namespace cv;
 	using namespace std;
 
+	constexpr float kWarpPaddingRatio = 0.05225f;
+	constexpr float kBrCornerCompensationRatio = 0.0160f;
+
 	struct Marker
 	{
 		Point2f center;
@@ -91,7 +94,7 @@ namespace ImgParse
 		}
 	}
 
-	bool orderThreeMarkersAsTLTRBL(const vector<Point3f>& centers, Point2f& tl, Point2f& tr, Point2f& bl)
+	bool extractThreeMarkerCorners(const vector<Point3f>& centers, Point2f& tl, Point2f& tr, Point2f& bl)
 	{
 		if (centers.size() != 3)
 		{
@@ -153,10 +156,10 @@ namespace ImgParse
 		return true;
 	}
 
-	vector<Point3f> FindMarkerCenters(const Mat& input, int ch)
+	vector<Point3f> FindMarkerCenters(const Mat& input, int channels)
 	{
 		Mat gray;
-		if (ch == 3)
+		if (channels == 3)
 		{
 			Mat hsv;
 			Mat binaryMask;
@@ -254,7 +257,7 @@ namespace ImgParse
 			return false;
 		}
 
-		// 统一先缩放到约 800 像素工作尺度：降低噪声与计算量, 同时稳定轮廓参数范围。
+		// Normalize to ~800px working scale to reduce noise and keep contour parameters stable.
 		const float scale = 800.0f / static_cast<float>(std::max(srcImg.cols, srcImg.rows));
 		Mat smallImg;
 		resize(srcImg, smallImg, Size(), scale, scale, INTER_AREA);
@@ -282,7 +285,7 @@ namespace ImgParse
 
 		if (centers.size() > 4)
 		{
-			// 选取距离整体中心更远的 4 点，优先保留外层定位块，抑制中心附近伪候选点。
+			// Keep the 4 points farther from global center to suppress central false candidates.
 			sort(centers.begin(), centers.end(), [&approxCenter](Point3f a, Point3f b)
 			{
 				return norm(Point2f(a.x, a.y) - approxCenter) > norm(Point2f(b.x, b.y) - approxCenter);
@@ -293,7 +296,7 @@ namespace ImgParse
 		Point2f tl, tr, br, bl;
 		if (centers.size() == 3)
 		{
-			if (!orderThreeMarkersAsTLTRBL(centers, tl, tr, bl))
+			if (!extractThreeMarkerCorners(centers, tl, tr, bl))
 			{
 				return false;
 			}
@@ -358,10 +361,10 @@ namespace ImgParse
 			tr = sortedPts[(sortedBrIdx + 3) % 4];
 		}
 
-		const float padX = outWidth * 0.05225f;
-		const float padY = outHeight * 0.05225f;
-		// 对右下角单独补偿，延续 warp_engine 的经验参数以改善透视下的底边对齐。
-		const float brCornerCompensation = outWidth * 0.0160f;
+		const float padX = outWidth * kWarpPaddingRatio;
+		const float padY = outHeight * kWarpPaddingRatio;
+		// Keep warp_engine-style BR-only compensation to improve bottom-edge alignment under perspective.
+		const float brCornerCompensation = outWidth * kBrCornerCompensationRatio;
 
 		const vector<Point2f> src = { tl, tr, br, bl };
 		const vector<Point2f> dst = {
