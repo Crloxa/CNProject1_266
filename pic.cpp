@@ -16,6 +16,7 @@ namespace ImgParse
 		constexpr int kFrameSize = 266;
 		constexpr float kFinderCenter = 21.0f;                 // aligned with current encoder finder-center mapping
 		constexpr float kOppositeFinderCenter = 245.0f;        // 266 - 21
+		constexpr float kMaxDetectionDimension = 800.0f;
 		constexpr int kThresholdBlockSize = 19;
 		constexpr int kThresholdBias = 10;
 
@@ -206,6 +207,8 @@ namespace ImgParse
 			for (int i = 0; i < 4; ++i)
 			{
 				const float dist = std::max(norm(candidates[i].center - exactCenter), 1.0f);
+				// Bottom-right marker tends to look relatively smaller under perspective and layout,
+				// so its area-to-distance^2 ratio is usually the smallest among four corners.
 				const float ratio = candidates[i].area / (dist * dist);
 				if (ratio < minRatio)
 				{
@@ -325,7 +328,7 @@ namespace ImgParse
 			return false;
 		}
 
-		const float scale = 800.0f / static_cast<float>(std::max(srcImg.cols, srcImg.rows));
+		const float scale = kMaxDetectionDimension / static_cast<float>(std::max(srcImg.cols, srcImg.rows));
 		Mat smallImg;
 		resize(srcImg, smallImg, Size(), scale, scale, INTER_AREA);
 
