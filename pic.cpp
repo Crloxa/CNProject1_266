@@ -29,6 +29,15 @@ namespace ImgParse
 
 		vector<Marker> findMarkerCenters(const Mat& input)
 		{
+			const int maxDim = std::max(input.cols, input.rows);
+			int adaptiveBlock = std::max(31, static_cast<int>(maxDim * 31.0 / 1920.0));
+			if ((adaptiveBlock & 1) == 0)
+			{
+				++adaptiveBlock;
+			}
+			const double minArea = std::max(15.0, static_cast<double>(maxDim) * maxDim * 0.000004);
+			const float mergeDistance = std::max(15.0f, static_cast<float>(maxDim) * 0.0078f);
+
 			Mat gray;
 			if (input.channels() == 3)
 			{
@@ -47,7 +56,7 @@ namespace ImgParse
 			}
 
 			Mat binary;
-			adaptiveThreshold(gray, binary, 255, ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY_INV, 101, 15);
+			adaptiveThreshold(gray, binary, 255, ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY_INV, adaptiveBlock, 15);
 			Mat kernel = getStructuringElement(MORPH_CROSS, Size(2, 2));
 			Mat closedBinary;
 			morphologyEx(binary, closedBinary, MORPH_CLOSE, kernel);
@@ -73,7 +82,7 @@ namespace ImgParse
 				if (nested >= 2)
 				{
 					const Moments mu = moments(contours[i], false);
-					if (mu.m00 >= 500.0)
+					if (mu.m00 >= minArea)
 					{
 						centers.push_back({ Point2f(static_cast<float>(mu.m10 / mu.m00), static_cast<float>(mu.m01 / mu.m00)), static_cast<float>(mu.m00) });
 					}
@@ -86,7 +95,7 @@ namespace ImgParse
 				bool isNew = true;
 				for (auto& m : merged)
 				{
-					if (norm(pt.center - m.center) < 100.0f)
+					if (norm(pt.center - m.center) < mergeDistance)
 					{
 						isNew = false;
 						if (pt.area > m.area)
