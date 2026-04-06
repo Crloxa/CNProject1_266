@@ -16,10 +16,10 @@ namespace ImgParse
 		constexpr float kFinderCenter = 21.0f;                 // center of each large 42x42 finder marker (index 12-15 ring: col/row 6..36, centroid=21)
 		constexpr float kOppositeFinderCenter = 245.0f;        // 266 - 21: center of TR/BL large markers
 		constexpr float kSmallFinderCenter = 252.5f;           // center of the small BR marker in logical frame: (SmallQrPointStart+SmallQrPointEnd)/2 = (246+259)/2
-		constexpr float kMaxDetectionDimension = 800.0f;
-		constexpr int kOriginalBlockSizeAt800px = 101;         // tuned adaptive-threshold block size for 800px images
-		constexpr double kOriginalMinAreaAt800px = 500.0;      // tuned minimum contour area for 800px images
-		constexpr float kOriginalMergeDist800px = 100.0f;      // tuned merge-distance for 800px images
+		constexpr float kMaxDetectionDimension = 800.0f;       // always resize to this before detection (same as modify/warp_engine)
+		constexpr int kDetectAdaptiveBlock = 101;              // tuned for 800px images (matches modify/warp_engine.cpp)
+		constexpr double kDetectMinArea = 500.0;               // tuned for 800px images (matches modify/warp_engine.cpp)
+		constexpr float kDetectMergeDistance = 100.0f;         // tuned for 800px images (matches modify/warp_engine.cpp)
 		constexpr int kThresholdBlockSize = 19;
 		constexpr int kThresholdBias = 10;
 
@@ -33,16 +33,6 @@ namespace ImgParse
 
 		vector<Marker> findMarkerCenters(const Mat& input)
 		{
-			const int maxDim = std::max(input.cols, input.rows);
-			// Scale from the original tuned values at 800px (see kOriginalXxxAt800px constants).
-			int adaptiveBlock = std::max(21, static_cast<int>(maxDim * kOriginalBlockSizeAt800px / kMaxDetectionDimension));
-			if ((adaptiveBlock & 1) == 0)
-			{
-				++adaptiveBlock;
-			}
-			const double minArea = std::max(50.0, static_cast<double>(maxDim) * maxDim * kOriginalMinAreaAt800px / (kMaxDetectionDimension * kMaxDetectionDimension));
-			const float mergeDistance = std::max(15.0f, static_cast<float>(maxDim) * kOriginalMergeDist800px / kMaxDetectionDimension);
-
 			Mat gray;
 			if (input.channels() == 3)
 			{
@@ -61,7 +51,7 @@ namespace ImgParse
 			}
 
 			Mat binary;
-			adaptiveThreshold(gray, binary, 255, ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY_INV, adaptiveBlock, 15);
+			adaptiveThreshold(gray, binary, 255, ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY_INV, kDetectAdaptiveBlock, 15);
 			Mat kernel = getStructuringElement(MORPH_CROSS, Size(2, 2));
 			Mat closedBinary;
 			morphologyEx(binary, closedBinary, MORPH_CLOSE, kernel);
@@ -87,7 +77,7 @@ namespace ImgParse
 				if (nested >= 2)
 				{
 					const Moments mu = moments(contours[i], false);
-					if (mu.m00 >= minArea)
+					if (mu.m00 >= kDetectMinArea)
 					{
 						const Point2f markerCenter(
 							static_cast<float>(mu.m10 / mu.m00),
@@ -104,7 +94,7 @@ namespace ImgParse
 				bool isNew = true;
 				for (auto& m : merged)
 				{
-					if (norm(pt.center - m.center) < mergeDistance)
+					if (norm(pt.center - m.center) < kDetectMergeDistance)
 					{
 						isNew = false;
 						if (pt.area > m.area)
@@ -255,10 +245,12 @@ namespace ImgParse
 			return false;
 		}
 
-		// Clamp to 1.0 so we never upscale; upscaling wastes time and can amplify noise.
-		const float scale = std::min(1.0f, kMaxDetectionDimension / static_cast<float>(std::max(srcImg.cols, srcImg.rows)));
+		// Always scale to exactly kMaxDetectionDimension (800px) for detection — matching
+		// modify/warp_engine.cpp. This ensures fixed params (block=101, minArea=500, etc.)
+		// work correctly for all input sizes, including sub-800px inputs that need upscaling.
+		const float scale = kMaxDetectionDimension / static_cast<float>(std::max(srcImg.cols, srcImg.rows));
 		Mat smallImg;
-		resize(srcImg, smallImg, Size(), scale, scale, INTER_AREA);
+		resize(srcImg, smallImg, Size(), scale, scale, scale > 1.0f ? INTER_LINEAR : INTER_AREA);
 
 		vector<Marker> smallMarkers = findMarkerCenters(smallImg);
 		vector<Marker> markers;
