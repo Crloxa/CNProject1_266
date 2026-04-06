@@ -206,7 +206,7 @@ namespace ImgParse
 			float minRatio = std::numeric_limits<float>::max();
 			for (int i = 0; i < 4; ++i)
 			{
-				const float dist = std::max(norm(candidates[i].center - exactCenter), 1.0f);
+				const float dist = static_cast<float>(std::max(norm(candidates[i].center - exactCenter), 1.0));
 				// Bottom-right marker tends to look relatively smaller under perspective and layout,
 				// so its area-to-distance^2 ratio is usually the smallest among four corners.
 				const float ratio = candidates[i].area / (dist * dist);
