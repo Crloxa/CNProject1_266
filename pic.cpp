@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <limits>
 #include <vector>
 
 namespace ImgParse
@@ -177,83 +176,6 @@ namespace ImgParse
 			}
 		}
 
-		bool sortPointsFromFourMarkers(const vector<Marker>& markers, array<Point2f, 4>& ordered)
-		{
-			if (markers.size() < 4)
-			{
-				return false;
-			}
-
-			vector<Marker> candidates = markers;
-			Point2f center(0.f, 0.f);
-			for (const auto& p : candidates)
-			{
-				center += p.center;
-			}
-			center *= (1.f / static_cast<float>(candidates.size()));
-			if (candidates.size() > 4)
-			{
-				sort(candidates.begin(), candidates.end(), [&center](const Marker& a, const Marker& b)
-				{
-					return norm(a.center - center) > norm(b.center - center);
-				});
-				candidates.resize(4);
-			}
-
-			Point2f exactCenter(0.f, 0.f);
-			for (const auto& p : candidates)
-			{
-				exactCenter += p.center;
-			}
-			exactCenter *= 0.25f;
-
-			int brIdx = -1;
-			float minRatio = std::numeric_limits<float>::max();
-			for (int i = 0; i < 4; ++i)
-			{
-				const float dist = static_cast<float>(std::max(norm(candidates[i].center - exactCenter), 1.0));
-				// Bottom-right marker tends to look relatively smaller under perspective and layout,
-				// so its area-to-distance^2 ratio is usually the smallest among four corners.
-				const float ratio = candidates[i].area / (dist * dist);
-				if (ratio < minRatio)
-				{
-					minRatio = ratio;
-					brIdx = i;
-				}
-			}
-			if (brIdx < 0)
-			{
-				return false;
-			}
-
-			vector<Point2f> sortedPts;
-			sortedPts.reserve(4);
-			for (const auto& p : candidates)
-			{
-				sortedPts.push_back(p.center);
-			}
-			sort(sortedPts.begin(), sortedPts.end(), [&exactCenter](const Point2f& a, const Point2f& b)
-			{
-				return atan2(a.y - exactCenter.y, a.x - exactCenter.x) < atan2(b.y - exactCenter.y, b.x - exactCenter.x);
-			});
-
-			int sortedBrIdx = 0;
-			for (int i = 0; i < 4; ++i)
-			{
-				if (norm(sortedPts[i] - candidates[brIdx].center) < 1.0f)
-				{
-					sortedBrIdx = i;
-					break;
-				}
-			}
-
-			ordered[2] = sortedPts[sortedBrIdx];
-			ordered[3] = sortedPts[(sortedBrIdx + 1) % 4];
-			ordered[0] = sortedPts[(sortedBrIdx + 2) % 4];
-			ordered[1] = sortedPts[(sortedBrIdx + 3) % 4];
-			return true;
-		}
-
 		bool sortPointsFromThreeMarkers(const vector<Marker>& markers, array<Point2f, 4>& ordered)
 		{
 			if (markers.size() < 3)
@@ -333,7 +255,8 @@ namespace ImgParse
 			return false;
 		}
 
-		const float scale = kMaxDetectionDimension / static_cast<float>(std::max(srcImg.cols, srcImg.rows));
+		// Clamp to 1.0 so we never upscale; upscaling wastes time and can amplify noise.
+		const float scale = std::min(1.0f, kMaxDetectionDimension / static_cast<float>(std::max(srcImg.cols, srcImg.rows)));
 		Mat smallImg;
 		resize(srcImg, smallImg, Size(), scale, scale, INTER_AREA);
 
@@ -345,13 +268,7 @@ namespace ImgParse
 			markers.push_back({ Point2f(pt.center.x / scale, pt.center.y / scale), pt.area });
 		}
 
-		array<Point2f, 4> srcPoints{};
-		bool sorted = sortPointsFromFourMarkers(markers, srcPoints);
-		if (!sorted)
-		{
-			sorted = sortPointsFromThreeMarkers(markers, srcPoints);
-		}
-		if (!sorted)
+		auto useCached = [&]() -> bool
 		{
 			if (g_lastValidTransform.empty())
 			{
@@ -361,13 +278,60 @@ namespace ImgParse
 			warpPerspective(srcImg, warped, g_lastValidTransform, Size(kFrameSize, kFrameSize), INTER_LINEAR);
 			blockwiseColorMaxAdaptiveThreshold(warped, disImg);
 			return true;
+		};
+
+		if (markers.size() < 3)
+		{
+			return useCached();
 		}
 
+		// Sort by area descending. The 3 largest are the big 42x42 finder markers (TL, TR, BL).
+		// This mirrors the V15process approach: always anchor on the three large structural markers,
+		// ignoring smaller candidates that can flicker frame-to-frame and cause tearing.
+		sort(markers.begin(), markers.end(), [](const Marker& a, const Marker& b)
+		{
+			return a.area > b.area;
+		});
+
+		const vector<Marker> largeMarkers(markers.begin(), markers.begin() + 3);
+		array<Point2f, 4> srcPoints{};
+		if (!sortPointsFromThreeMarkers(largeMarkers, srcPoints))
+		{
+			return useCached();
+		}
+
+		// srcPoints: [0]=TL, [1]=TR, [2]=estimated BR (parallelogram TR+BL-TL), [3]=BL.
+		// Optionally refine the BR point: look for a small marker (area significantly below the
+		// large ones) that lies within 35% of the TL-TR side length from the estimated BR position.
+		// 35% covers the geometric offset between the parallelogram estimate and the actual small
+		// marker position, plus typical detection noise, without accepting distant false positives.
+		const float searchRadius = static_cast<float>(norm(srcPoints[1] - srcPoints[0])) * 0.35f;
+		// Reject any candidate whose area is more than half that of the smallest large marker;
+		// the small BR finder pattern (14x14 logical) is at most ~1/9 the area of a large one (42x42),
+		// so 0.5 comfortably separates small from large while tolerating detection variation.
+		const float maxSmallArea = largeMarkers[2].area * 0.5f;
+		bool foundSmallBR = false;
+		for (size_t i = 3; i < markers.size(); ++i)
+		{
+			if (markers[i].area > maxSmallArea)
+			{
+				continue;
+			}
+			const float dist = static_cast<float>(norm(markers[i].center - srcPoints[2]));
+			if (dist < searchRadius)
+			{
+				srcPoints[2] = markers[i].center;
+				foundSmallBR = true;
+				break;
+			}
+		}
+
+		const float brDstCoord = foundSmallBR ? kSmallFinderCenter : kOppositeFinderCenter;
 		const array<Point2f, 4> dstPoints =
 		{ {
 			Point2f(kFinderCenter, kFinderCenter),
 			Point2f(kOppositeFinderCenter, kFinderCenter),
-			Point2f(kSmallFinderCenter, kSmallFinderCenter),
+			Point2f(brDstCoord, brDstCoord),
 			Point2f(kFinderCenter, kOppositeFinderCenter)
 		} };
 
