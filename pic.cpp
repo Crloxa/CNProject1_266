@@ -14,9 +14,13 @@ namespace ImgParse
 	namespace
 	{
 		constexpr int kFrameSize = 266;
-		constexpr float kFinderCenter = 21.0f;                 // aligned with current encoder finder-center mapping
-		constexpr float kOppositeFinderCenter = 245.0f;        // 266 - 21
+		constexpr float kFinderCenter = 21.0f;                 // center of each large 42x42 finder marker (index 12-15 ring: col/row 6..36, centroid=21)
+		constexpr float kOppositeFinderCenter = 245.0f;        // 266 - 21: center of TR/BL large markers
+		constexpr float kSmallFinderCenter = 252.5f;           // center of the small BR marker in logical frame: (SmallQrPointStart+SmallQrPointEnd)/2 = (246+259)/2
 		constexpr float kMaxDetectionDimension = 800.0f;
+		constexpr int kOriginalBlockSizeAt800px = 101;         // tuned adaptive-threshold block size for 800px images
+		constexpr double kOriginalMinAreaAt800px = 500.0;      // tuned minimum contour area for 800px images
+		constexpr float kOriginalMergeDist800px = 100.0f;      // tuned merge-distance for 800px images
 		constexpr int kThresholdBlockSize = 19;
 		constexpr int kThresholdBias = 10;
 
@@ -31,13 +35,14 @@ namespace ImgParse
 		vector<Marker> findMarkerCenters(const Mat& input)
 		{
 			const int maxDim = std::max(input.cols, input.rows);
-			int adaptiveBlock = std::max(31, static_cast<int>(maxDim * 31.0 / 1920.0));
+			// Scale from the original tuned values at 800px (see kOriginalXxxAt800px constants).
+			int adaptiveBlock = std::max(21, static_cast<int>(maxDim * kOriginalBlockSizeAt800px / kMaxDetectionDimension));
 			if ((adaptiveBlock & 1) == 0)
 			{
 				++adaptiveBlock;
 			}
-			const double minArea = std::max(15.0, static_cast<double>(maxDim) * maxDim * 0.000004);
-			const float mergeDistance = std::max(15.0f, static_cast<float>(maxDim) * 0.0078f);
+			const double minArea = std::max(50.0, static_cast<double>(maxDim) * maxDim * kOriginalMinAreaAt800px / (kMaxDetectionDimension * kMaxDetectionDimension));
+			const float mergeDistance = std::max(15.0f, static_cast<float>(maxDim) * kOriginalMergeDist800px / kMaxDetectionDimension);
 
 			Mat gray;
 			if (input.channels() == 3)
@@ -362,7 +367,7 @@ namespace ImgParse
 		{ {
 			Point2f(kFinderCenter, kFinderCenter),
 			Point2f(kOppositeFinderCenter, kFinderCenter),
-			Point2f(kOppositeFinderCenter, kOppositeFinderCenter),
+			Point2f(kSmallFinderCenter, kSmallFinderCenter),
 			Point2f(kFinderCenter, kOppositeFinderCenter)
 		} };
 
