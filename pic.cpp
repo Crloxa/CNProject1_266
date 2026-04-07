@@ -235,7 +235,21 @@ namespace ImgParse
 
 		auto warpColor = [&](const Mat& M) -> bool
 			{
-				warpPerspective(srcImg, disImg, M, Size(kFrameSize, kFrameSize), INTER_NEAREST);
+				Mat warped;
+				warpPerspective(srcImg, warped, M, Size(kFrameSize, kFrameSize), INTER_LINEAR);
+				// Otsu binarize: same method as the square fast-path, produces clean black/white
+				// output for ImageDecode and eliminates moiré from the ~7x downscale.
+				Mat warpedGray;
+				cvtColor(warped, warpedGray, COLOR_BGR2GRAY);
+				Mat binRaw;
+				threshold(warpedGray, binRaw, 0, 255, THRESH_BINARY | THRESH_OTSU);
+				disImg.create(kFrameSize, kFrameSize, CV_8UC3);
+				for (int r = 0; r < kFrameSize; ++r)
+					for (int c = 0; c < kFrameSize; ++c)
+					{
+						const uint8_t val = binRaw.at<uint8_t>(r, c);
+						disImg.at<Vec3b>(r, c) = val ? Vec3b(255, 255, 255) : Vec3b(0, 0, 0);
+					}
 				return true;
 			};
 
