@@ -240,19 +240,30 @@ namespace ImgParse
 				if (srcImg.channels() == 3) cvtColor(srcImg, grayFull, COLOR_BGR2GRAY);
 				else                        grayFull = srcImg.clone();
 
-				// Step 2: binarize at full resolution with adaptive threshold (local contrast).
+				// Step 2: suppress moire / sensor noise with a small Gaussian blur.
+				//         Moire cycles between camera pixels and screen pixels are
+				//         typically ≤ 7 px at 1920p, while each data cell maps to
+				//         ~7 px.  A 5-px blur (scaled) averages out the moire within
+				//         each cell without blurring across cell boundaries.
+				//         This mirrors the blur step in locateCorners().
+				const int maxDim = std::max(srcImg.cols, srcImg.rows);
+				int blurSz = std::max(5, static_cast<int>(maxDim * 5.0 / 1920.0));
+				if (blurSz % 2 == 0) ++blurSz;
+				Mat blurredFull;
+				GaussianBlur(grayFull, blurredFull, Size(blurSz, blurSz), 0);
+
+				// Step 3: binarize at full resolution with adaptive threshold (local contrast).
 				//         Doing this BEFORE the warp (like warp_engine.cpp) avoids the
 				//         "too-much-white" Otsu bias that occurs after INTER_AREA averaging
 				//         produces gray border pixels at reduced resolution.
 				//         blockSz scales with image size; C=15 matches warp_engine.cpp.
-				const int maxDim = std::max(srcImg.cols, srcImg.rows);
 				int binBlockSz = std::max(101, static_cast<int>(maxDim * 101.0 / 1920.0));
 				if (binBlockSz % 2 == 0) ++binBlockSz;
 				Mat binFull;
-				adaptiveThreshold(grayFull, binFull, 255,
+				adaptiveThreshold(blurredFull, binFull, 255,
 					ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY, binBlockSz, 15);
 
-				// Step 3: warp the binary image to 266×266 with INTER_NEAREST
+				// Step 4: warp the binary image to 266×266 with INTER_NEAREST
 				//         (following warp_engine.cpp). Since binFull is pure 0/255,
 				//         INTER_NEAREST keeps values clean — no gray transitions to
 				//         confuse the decoder's isWhiteCell threshold.
