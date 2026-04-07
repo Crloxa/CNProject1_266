@@ -53,13 +53,13 @@ int VideoToFile(const char* videoPath, const char* filePath)
 	std::filesystem::create_directory("pic_output", ec);
 
 	std::cout << "Extracting frames from video... Please wait." << std::endl;
-	FFMPEG::VideotoImage(videoPath, "inputImg", "jpg");
+	FFMPEG::VideotoImage(videoPath, "inputImg", "png");
 	std::cout << "Frames extraction completed. Start decoding..." << std::endl;
 
 	std::vector<std::string> imageFiles;
 	for (const auto& entry : std::filesystem::directory_iterator("inputImg", ec))
 	{
-		if (entry.is_regular_file() && entry.path().extension() == ".jpg")
+		if (entry.is_regular_file() && entry.path().extension() == ".png")
 		{
 			imageFiles.push_back(entry.path().string());
 		}
