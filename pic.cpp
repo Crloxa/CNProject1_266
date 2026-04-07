@@ -166,74 +166,105 @@ namespace ImgParse
 			}
 		}
 
-		bool sortPointsFromThreeMarkers(const vector<Marker>& markers, array<Point2f, 4>& ordered)
+		// Sort 4 markers into [TL, TR, BR, BL] using the anti-perspective-flip + rotation
+		// logic from modify/warp_engine.cpp.
+		// Requires at least 4 markers. If more than 4 are present the 4 farthest from the
+		// approximate center are kept (same selection as warp_engine).
+		// BR is identified by the minimum area/(dist²) ratio — the small BR finder has a
+		// disproportionately small area relative to its distance from the center compared to
+		// the three large corner finders.  The remaining three are then assigned by sorting
+		// all four by polar angle around the exact centroid.
+		bool sortFourMarkers(const vector<Marker>& markers, array<Point2f, 4>& ordered)
 		{
-			if (markers.size() < 3)
+			if (markers.size() < 4)
 			{
 				return false;
 			}
 
-			vector<Marker> m = markers;
-			sort(m.begin(), m.end(), [](const Marker& a, const Marker& b)
-			{
-				return a.area > b.area;
-			});
-			m.resize(3);
+			vector<Marker> pts(markers);
 
-			double maxDist = 0.0;
-			int rightAngleIdx = -1;
-			for (int i = 0; i < 3; ++i)
+			// Approximate center over all detected candidates.
+			Point2f approxCenter(0.0f, 0.0f);
+			for (const auto& p : pts)
 			{
-				for (int j = i + 1; j < 3; ++j)
+				approxCenter += p.center;
+			}
+			approxCenter.x /= static_cast<float>(pts.size());
+			approxCenter.y /= static_cast<float>(pts.size());
+
+			// If more than 4, keep the 4 farthest from the approximate center — they are
+			// the outermost structural markers.
+			if (pts.size() > 4)
+			{
+				sort(pts.begin(), pts.end(), [&approxCenter](const Marker& a, const Marker& b)
 				{
-					const double d = norm(m[i].center - m[j].center);
-					if (d > maxDist)
-					{
-						maxDist = d;
-						rightAngleIdx = 3 - i - j;
-					}
+					return norm(a.center - approxCenter) > norm(b.center - approxCenter);
+				});
+				pts.resize(4);
+			}
+
+			// Exact centroid of the 4 selected markers.
+			Point2f exactCenter(0.0f, 0.0f);
+			for (const auto& p : pts)
+			{
+				exactCenter += p.center;
+			}
+			exactCenter.x /= 4.0f;
+			exactCenter.y /= 4.0f;
+
+			// BR finder: smallest area/(dist²) ratio — it is physically smaller than the
+			// three large finders, so its area is low relative to its corner distance.
+			int brIdx = -1;
+			float minRatio = 1e9f;
+			for (int i = 0; i < 4; ++i)
+			{
+				const float dist = static_cast<float>(norm(pts[i].center - exactCenter));
+				if (dist < 1.0f)
+				{
+					continue;
+				}
+				const float ratio = pts[i].area / (dist * dist);
+				if (ratio < minRatio)
+				{
+					minRatio = ratio;
+					brIdx = i;
 				}
 			}
-			if (rightAngleIdx < 0)
+			if (brIdx < 0)
 			{
 				return false;
 			}
 
-			const Point2f tl = m[rightAngleIdx].center;
-			const Point2f p1 = m[(rightAngleIdx + 1) % 3].center;
-			const Point2f p2 = m[(rightAngleIdx + 2) % 3].center;
-			const Point2f v1 = p1 - tl;
-			const Point2f v2 = p2 - tl;
-			const double len1 = norm(v1);
-			const double len2 = norm(v2);
-			const double legRatio = len1 / std::max(len2, 1.0);
-			if (legRatio < 0.4 || legRatio > 2.5)
+			// Sort all 4 by polar angle around exactCenter (counter-clockwise from -π).
+			vector<Point2f> sortedPts;
+			sortedPts.reserve(4);
+			for (const auto& p : pts)
 			{
-				return false;
+				sortedPts.push_back(p.center);
 			}
-			const double cosTheta = (v1.x * v2.x + v1.y * v2.y) / std::max(len1 * len2, 1.0);
-			if (std::abs(cosTheta) > 0.75)
+			sort(sortedPts.begin(), sortedPts.end(), [&exactCenter](const Point2f& a, const Point2f& b)
 			{
-				return false;
+				return atan2(a.y - exactCenter.y, a.x - exactCenter.x)
+				     < atan2(b.y - exactCenter.y, b.x - exactCenter.x);
+			});
+
+			// Locate BR in the angle-sorted list.
+			const Point2f brPoint = pts[brIdx].center;
+			int sortedBrIdx = 0;
+			for (int i = 0; i < 4; ++i)
+			{
+				if (norm(sortedPts[i] - brPoint) < 1.0f)
+				{
+					sortedBrIdx = i;
+					break;
+				}
 			}
 
-			Point2f tr, bl;
-			const float cross = v1.x * v2.y - v1.y * v2.x;
-			if (cross > 0)
-			{
-				tr = p1;
-				bl = p2;
-			}
-			else
-			{
-				tr = p2;
-				bl = p1;
-			}
-			const Point2f br = tr + bl - tl;
-			ordered[0] = tl;
-			ordered[1] = tr;
-			ordered[2] = br;
-			ordered[3] = bl;
+			// Angular order starting from BR: BR → BL → TL → TR (CCW).
+			ordered[2] = sortedPts[sortedBrIdx];                  // BR
+			ordered[3] = sortedPts[(sortedBrIdx + 1) % 4];        // BL
+			ordered[0] = sortedPts[(sortedBrIdx + 2) % 4];        // TL
+			ordered[1] = sortedPts[(sortedBrIdx + 3) % 4];        // TR
 			return true;
 		}
 	}
@@ -272,52 +303,16 @@ namespace ImgParse
 			return true;
 		};
 
-		if (markers.size() < 3)
+		if (markers.size() < 4)
 		{
 			return useCached();
 		}
 
-		// Sort by area descending. The 3 largest are the big 42x42 finder markers (TL, TR, BL).
-		// This mirrors the V15process approach: always anchor on the three large structural markers,
-		// ignoring smaller candidates that can flicker frame-to-frame and cause tearing.
-		sort(markers.begin(), markers.end(), [](const Marker& a, const Marker& b)
-		{
-			return a.area > b.area;
-		});
-
-		const vector<Marker> largeMarkers(markers.begin(), markers.begin() + 3);
 		array<Point2f, 4> srcPoints{};
-		if (!sortPointsFromThreeMarkers(largeMarkers, srcPoints))
+		if (!sortFourMarkers(markers, srcPoints))
 		{
 			return useCached();
 		}
-
-		// srcPoints: [0]=TL, [1]=TR, [2]=estimated BR (parallelogram TR+BL-TL), [3]=BL.
-		// Optionally refine the BR point: look for a small marker (area significantly below the
-		// large ones) that lies within 35% of the TL-TR side length from the estimated BR position.
-		// 35% covers the geometric offset between the parallelogram estimate and the actual small
-		// marker position, plus typical detection noise, without accepting distant false positives.
-		const float searchRadius = static_cast<float>(norm(srcPoints[1] - srcPoints[0])) * 0.35f;
-		// Reject any candidate whose area is more than half that of the smallest large marker;
-		// the small BR finder pattern (14x14 logical) is at most ~1/9 the area of a large one (42x42),
-		// so 0.5 comfortably separates small from large while tolerating detection variation.
-		const float maxSmallArea = largeMarkers[2].area * 0.5f;
-		bool foundSmallBR = false;
-		for (size_t i = 3; i < markers.size(); ++i)
-		{
-			if (markers[i].area > maxSmallArea)
-			{
-				continue;
-			}
-			const float dist = static_cast<float>(norm(markers[i].center - srcPoints[2]));
-			if (dist < searchRadius)
-			{
-				srcPoints[2] = markers[i].center;
-				foundSmallBR = true;
-				break;
-			}
-		}
-		(void)foundSmallBR;
 
 		const array<Point2f, 4> dstPoints =
 		{ {
