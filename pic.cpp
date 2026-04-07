@@ -235,38 +235,31 @@ namespace ImgParse
 
 		auto warpColor = [&](const Mat& M) -> bool
 			{
-				// Step 1: convert to grayscale BEFORE warp (eliminates chromatic moiré
-				//         caused by per-channel phase differences when warping colour directly).
+				// Step 1: convert to grayscale.
 				Mat grayFull;
 				if (srcImg.channels() == 3) cvtColor(srcImg, grayFull, COLOR_BGR2GRAY);
 				else                        grayFull = srcImg.clone();
 
-				// Step 2: warp to kScale × kFrameSize intermediate canvas.
-				//         kScale=4 gives 266×4=1064; this is large enough that each output
-				//         pixel of the final 266 maps to exactly 4×4=16 intermediate pixels,
-				//         letting INTER_AREA average away aliasing completely (Nyquist-safe).
-				//         INTER_LINEAR on the larger target keeps the high-frequency signal
-				//         intact; moiré is eliminated in step 3 instead.
-				constexpr int kScale     = 4;
-				constexpr int kInterSize = kFrameSize * kScale;
-				Mat S = Mat::eye(3, 3, CV_64F);
-				S.at<double>(0, 0) = kScale;
-				S.at<double>(1, 1) = kScale;
-				const Mat Mscaled = S * M;
-				Mat warped;
-				warpPerspective(grayFull, warped, Mscaled, Size(kInterSize, kInterSize), INTER_LINEAR);
+				// Step 2: binarize at full resolution with adaptive threshold (local contrast).
+				//         Doing this BEFORE the warp (like warp_engine.cpp) avoids the
+				//         "too-much-white" Otsu bias that occurs after INTER_AREA averaging
+				//         produces gray border pixels at reduced resolution.
+				//         blockSz scales with image size; C=15 matches warp_engine.cpp.
+				const int maxDim = std::max(srcImg.cols, srcImg.rows);
+				int binBlockSz = std::max(101, static_cast<int>(maxDim * 101.0 / 1920.0));
+				if (binBlockSz % 2 == 0) ++binBlockSz;
+				Mat binFull;
+				adaptiveThreshold(grayFull, binFull, 255,
+					ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY, binBlockSz, 15);
 
-				// Step 3: INTER_AREA resize from intermediate to target.
-				//         INTER_AREA is a proper box-filter / area-averaging downscale that
-				//         prevents aliasing and moiré — it cannot be used directly in
-				//         warpPerspective, which is why the two-step approach is needed.
+				// Step 3: warp the binary image to 266×266 with INTER_NEAREST
+				//         (following warp_engine.cpp). Since binFull is pure 0/255,
+				//         INTER_NEAREST keeps values clean — no gray transitions to
+				//         confuse the decoder's isWhiteCell threshold.
 				Mat warped266;
-				resize(warped, warped266, Size(kFrameSize, kFrameSize), 0, 0, INTER_AREA);
+				warpPerspective(binFull, warped266, M, Size(kFrameSize, kFrameSize), INTER_NEAREST);
 
-				// Step 4: Otsu global binarization on the smooth grayscale result.
-				Mat binRaw;
-				threshold(warped266, binRaw, 0, 255, THRESH_BINARY | THRESH_OTSU);
-				cvtColor(binRaw, disImg, COLOR_GRAY2BGR);
+				cvtColor(warped266, disImg, COLOR_GRAY2BGR);
 				return true;
 			};
 
