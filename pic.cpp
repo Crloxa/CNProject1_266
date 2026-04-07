@@ -203,26 +203,25 @@ namespace ImgParse
 			g_lastValidTransform = Mat();
 		}
 
-		// Square-input fast path: direct Otsu resize (from modify/pic.cpp).
+		// Square-input fast path: resize with INTER_AREA (proportional voting over source
+		// pixels per output cell), then Otsu binarize the averaged 266×266 result.
 		const double aspect = static_cast<double>(srcImg.cols) / srcImg.rows;
 		if (aspect > 0.95 && aspect < 1.05 && srcImg.cols > 200)
 		{
 			Mat imgGray;
 			if (srcImg.channels() == 3) cvtColor(srcImg, imgGray, COLOR_BGR2GRAY);
 			else                        imgGray = srcImg.clone();
-			Mat binRaw;
-			threshold(imgGray, binRaw, 0, 255, THRESH_BINARY_INV | THRESH_OTSU);
-			disImg.create(kFrameSize, kFrameSize, CV_8UC3);
-			const float stepX = static_cast<float>(srcImg.cols) / kFrameSize;
-			const float stepY = static_cast<float>(srcImg.rows) / kFrameSize;
-			for (int r = 0; r < kFrameSize; ++r)
-				for (int c = 0; c < kFrameSize; ++c)
-				{
-					const int px = std::min(static_cast<int>((c + 0.5f) * stepX), srcImg.cols - 1);
-					const int py = std::min(static_cast<int>((r + 0.5f) * stepY), srcImg.rows - 1);
-					const uint8_t val = binRaw.at<uint8_t>(py, px);
-					disImg.at<Vec3b>(r, c) = val ? Vec3b(255, 255, 255) : Vec3b(0, 0, 0);
-				}
+
+			// INTER_AREA averages all source pixels that map into each output cell —
+			// this is the proportional majority vote on the original image.
+			Mat resized266;
+			resize(imgGray, resized266, Size(kFrameSize, kFrameSize), 0, 0, INTER_AREA);
+
+			// After averaging, the histogram is cleanly bimodal; Otsu is reliable here.
+			Mat bin266;
+			threshold(resized266, bin266, 0, 255, THRESH_BINARY | THRESH_OTSU);
+
+			cvtColor(bin266, disImg, COLOR_GRAY2BGR);
 			return true;
 		}
 
@@ -235,42 +234,67 @@ namespace ImgParse
 
 		auto warpColor = [&](const Mat& M) -> bool
 			{
-				// Step 1: convert to grayscale.
+				// Step 1: convert to grayscale (work on the original, unprocessed image).
 				Mat grayFull;
 				if (srcImg.channels() == 3) cvtColor(srcImg, grayFull, COLOR_BGR2GRAY);
 				else                        grayFull = srcImg.clone();
 
-				// Step 2: suppress moire with a median blur.
-				//         Median blur removes periodic interference (moire) without
-				//         blurring the gradients that Gaussian blur would introduce.
-				//         Unlike Gaussian, median produces no gray halos, so the
-				//         subsequent large-window adaptive threshold cannot form ring
-				//         artifacts.  A 3-pixel kernel (scaled to image size, always odd)
-				//         eliminates moire cycles while preserving cell boundaries.
-				const int maxDim = std::max(srcImg.cols, srcImg.rows);
-				int medSz = std::max(3, static_cast<int>(maxDim * 3.0 / 1920.0));
-				if (medSz % 2 == 0) ++medSz;
-				Mat blurredFull;
-				medianBlur(grayFull, blurredFull, medSz);
+				// Step 2: compute inverse perspective transform so we can map each
+				//         output cell back to its location in the original image.
+				Mat M_inv;
+				invert(M, M_inv);
 
-				// Step 3: binarize at full resolution using global Otsu threshold.
-				//         Otsu finds the optimal split between the dark-cell and
-				//         bright-cell peaks of the bimodal screen histogram.
-				//         Doing this BEFORE the warp avoids the gray border pixels
-				//         that INTER_AREA downsampling introduces, which would
-				//         skew Otsu toward the white end at 266×266.
-				//         This mirrors the square fast-path (THRESH_BINARY_INV | THRESH_OTSU).
-				Mat binFull;
-				threshold(blurredFull, binFull, 0, 255, THRESH_BINARY_INV | THRESH_OTSU);
+				// Helper: map an output point (x, y) to source coordinates.
+				auto mapPt = [&](float x, float y) -> Point2f
+					{
+						const double wx = M_inv.at<double>(0, 0) * x + M_inv.at<double>(0, 1) * y + M_inv.at<double>(0, 2);
+						const double wy = M_inv.at<double>(1, 0) * x + M_inv.at<double>(1, 1) * y + M_inv.at<double>(1, 2);
+						const double wz = M_inv.at<double>(2, 0) * x + M_inv.at<double>(2, 1) * y + M_inv.at<double>(2, 2);
+						return Point2f(static_cast<float>(wx / wz), static_cast<float>(wy / wz));
+					};
 
-				// Step 4: warp the binary image to 266×266 with INTER_NEAREST
-				//         (following warp_engine.cpp). Since binFull is pure 0/255,
-				//         INTER_NEAREST keeps values clean — no gray transitions to
-				//         confuse the decoder's isWhiteCell threshold.
-				Mat warped266;
-				warpPerspective(binFull, warped266, M, Size(kFrameSize, kFrameSize), INTER_NEAREST);
+				// Step 3: estimate the local scale (source pixels per output cell) at the
+				//         image centre so we know how large a patch to sample per cell.
+				const float fc = kFrameSize / 2.0f, fr = kFrameSize / 2.0f;
+				const float scale = static_cast<float>(norm(mapPt(fc + 1.0f, fr) - mapPt(fc, fr)));
+				const int halfR = std::max(1, static_cast<int>(scale * 0.5f));
 
-				cvtColor(warped266, disImg, COLOR_GRAY2BGR);
+				// Step 4: determine binarisation threshold from the barcode region only.
+				//         Warp the grayscale with INTER_LINEAR to get a 266×266 view of
+				//         just the barcode, then let Otsu pick the split on that bimodal
+				//         histogram.  This avoids the threshold being skewed by background
+				//         pixels outside the barcode.
+				Mat warpedForThresh;
+				warpPerspective(grayFull, warpedForThresh, M, Size(kFrameSize, kFrameSize), INTER_LINEAR);
+				Mat tmpBin;
+				const double otsuThresh = threshold(warpedForThresh, tmpBin, 0, 255, THRESH_BINARY | THRESH_OTSU);
+
+				// Step 5: for each output cell, vote proportionally on the original image.
+				//         Each cell maps back to a patch of roughly (2*halfR+1)² source
+				//         pixels.  We count how many exceed the Otsu threshold and declare
+				//         the cell white if the majority does — true proportional voting
+				//         directly on the original, without any prior binarisation step.
+				disImg.create(kFrameSize, kFrameSize, CV_8UC3);
+				const int srcCols = grayFull.cols, srcRows = grayFull.rows;
+				for (int r = 0; r < kFrameSize; ++r)
+					for (int c = 0; c < kFrameSize; ++c)
+					{
+						const Point2f sp = mapPt(static_cast<float>(c), static_cast<float>(r));
+						const int cx0 = static_cast<int>(sp.x + 0.5f);
+						const int cy0 = static_cast<int>(sp.y + 0.5f);
+						int white = 0, total = 0;
+						for (int dy = -halfR; dy <= halfR; ++dy)
+							for (int dx = -halfR; dx <= halfR; ++dx)
+							{
+								const int px = std::max(0, std::min(srcCols - 1, cx0 + dx));
+								const int py = std::max(0, std::min(srcRows - 1, cy0 + dy));
+								if (grayFull.at<uint8_t>(py, px) > static_cast<uint8_t>(otsuThresh))
+									++white;
+								++total;
+							}
+						disImg.at<Vec3b>(r, c) = (white * 2 >= total)
+							? Vec3b(255, 255, 255) : Vec3b(0, 0, 0);
+					}
 				return true;
 			};
 
