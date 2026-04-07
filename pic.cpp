@@ -211,7 +211,7 @@ namespace ImgParse
 			if (srcImg.channels() == 3) cvtColor(srcImg, imgGray, COLOR_BGR2GRAY);
 			else                        imgGray = srcImg.clone();
 			Mat binRaw;
-			threshold(imgGray, binRaw, 0, 255, THRESH_BINARY | THRESH_OTSU);
+			threshold(imgGray, binRaw, 0, 255, THRESH_BINARY_INV | THRESH_OTSU);
 			disImg.create(kFrameSize, kFrameSize, CV_8UC3);
 			const float stepX = static_cast<float>(srcImg.cols) / kFrameSize;
 			const float stepY = static_cast<float>(srcImg.rows) / kFrameSize;
@@ -259,9 +259,9 @@ namespace ImgParse
 				//         Doing this BEFORE the warp avoids the gray border pixels
 				//         that INTER_AREA downsampling introduces, which would
 				//         skew Otsu toward the white end at 266×266.
-				//         This mirrors the square fast-path (THRESH_BINARY | THRESH_OTSU).
+				//         This mirrors the square fast-path (THRESH_BINARY_INV | THRESH_OTSU).
 				Mat binFull;
-				threshold(blurredFull, binFull, 0, 255, THRESH_BINARY | THRESH_OTSU);
+				threshold(blurredFull, binFull, 0, 255, THRESH_BINARY_INV | THRESH_OTSU);
 
 				// Step 4: warp the binary image to 266×266 with INTER_NEAREST
 				//         (following warp_engine.cpp). Since binFull is pure 0/255,
