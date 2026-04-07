@@ -19,7 +19,9 @@ namespace ImgParse
 			double  area;
 		};
 
-		Mat g_lastValidTransform;
+		// Cached corners from the most recent successful detection.
+		struct CachedCorners { Point2f tl, tr, br, bl; bool valid = false; };
+		CachedCorners g_cachedCorners;
 		int g_lastCols = 0;
 		int g_lastRows = 0;
 		int g_frameCount = 0;
@@ -194,13 +196,13 @@ namespace ImgParse
 	{
 		if (srcImg.empty()) return false;
 
-		// Reset cached transform when input resolution changes (from modify/pic.cpp).
+		// Reset cached corners when input resolution changes.
 		if (srcImg.cols != g_lastCols || srcImg.rows != g_lastRows)
 		{
 			g_lastCols = srcImg.cols;
 			g_lastRows = srcImg.rows;
 			g_frameCount = 0;
-			g_lastValidTransform = Mat();
+			g_cachedCorners.valid = false;
 		}
 
 		// Square-input fast path: resize with INTER_AREA (proportional voting over source
@@ -225,86 +227,60 @@ namespace ImgParse
 			return true;
 		}
 
-		// Warmup: skip the first few frames until detection is stable (from modify/pic.cpp).
+		// Warmup: skip the first few frames until detection is stable.
 		if (g_frameCount < 3)
 		{
 			++g_frameCount;
 			return false;
 		}
 
-		auto warpColor = [&](const Mat& M) -> bool
+		// Forward-warp approach (reference: pic_color.cpp):
+		// 1. Warp original grayscale to the barcode's natural pixel size (targetSize).
+		// 2. Resize to 266×266 with INTER_AREA — true proportional voting: each output
+		//    cell averages every source pixel in its corresponding region, avoiding moiré.
+		// 3. Otsu threshold → output as CV_8UC3.
+		auto warpBW = [&](Point2f tl, Point2f tr, Point2f br, Point2f bl) -> bool
 			{
-				// Step 1: convert to grayscale (work on the original, unprocessed image).
 				Mat grayFull;
 				if (srcImg.channels() == 3) cvtColor(srcImg, grayFull, COLOR_BGR2GRAY);
 				else                        grayFull = srcImg.clone();
 
-				// Step 2: compute inverse perspective transform so we can map each
-				//         output cell back to its location in the original image.
-				Mat M_inv;
-				invert(M, M_inv);
+				// Estimate natural barcode side length in source pixels.
+				// Finder-marker centres span 224 pixels of the 266-wide full barcode
+				// (positions 21 and 245), i.e. 112/133 cells.  Multiply by 133/112.
+				const double edgeLen = std::min(norm(tr - tl), norm(bl - tl));
+				const int targetSize = std::max(kFrameSize,
+					static_cast<int>(std::round(edgeLen * 133.0 / 112.0)));
 
-				// Helper: map an output point (x, y) to source coordinates.
-				auto mapPt = [&](float x, float y) -> Point2f
-					{
-						const double wx = M_inv.at<double>(0, 0) * x + M_inv.at<double>(0, 1) * y + M_inv.at<double>(0, 2);
-						const double wy = M_inv.at<double>(1, 0) * x + M_inv.at<double>(1, 1) * y + M_inv.at<double>(1, 2);
-						const double wz = M_inv.at<double>(2, 0) * x + M_inv.at<double>(2, 1) * y + M_inv.at<double>(2, 2);
-						return Point2f(static_cast<float>(wx / wz), static_cast<float>(wy / wz));
-					};
+				const float k = static_cast<float>(targetSize) / kFrameSize;
 
-				// Step 3: estimate the local scale (source pixels per output cell) at the
-				//         image centre so we know how large a patch to sample per cell.
-				const float fc = kFrameSize / 2.0f, fr = kFrameSize / 2.0f;
-				const float scale = static_cast<float>(norm(mapPt(fc + 1.0f, fr) - mapPt(fc, fr)));
-				const int halfR = std::max(1, static_cast<int>(scale * 0.5f));
+				// Build transform: finder-marker centres → scaled positions in targetSize space.
+				const vector<Point2f> srcPts = { tl, tr, br, bl };
+				const vector<Point2f> dstPts = {
+					Point2f(21.0f * k, 21.0f * k),
+					Point2f(245.0f * k, 21.0f * k),
+					Point2f(253.5f * k, 253.5f * k),
+					Point2f(21.0f * k, 245.0f * k)
+				};
+				const Mat M = getPerspectiveTransform(srcPts, dstPts);
 
-				// Step 4: determine binarisation threshold from the barcode region only.
-				//         Warp the grayscale with INTER_LINEAR to get a 266×266 view of
-				//         just the barcode, then let Otsu pick the split on that bimodal
-				//         histogram.  This avoids the threshold being skewed by background
-				//         pixels outside the barcode.
-				Mat warpedForThresh;
-				warpPerspective(grayFull, warpedForThresh, M, Size(kFrameSize, kFrameSize), INTER_LINEAR);
-				Mat tmpBin;
-				const double otsuThresh = threshold(warpedForThresh, tmpBin, 0, 255, THRESH_BINARY | THRESH_OTSU);
+				// Step 1: forward-warp to natural barcode size.
+				Mat warped;
+				warpPerspective(grayFull, warped, M, Size(targetSize, targetSize), INTER_LINEAR);
 
-				// Step 5: for each output cell, vote proportionally on the original image.
-				//         Each cell maps back to a patch of roughly (2*halfR+1)² source
-				//         pixels.  We count how many exceed the Otsu threshold and declare
-				//         the cell white if the majority does — true proportional voting
-				//         directly on the original, without any prior binarisation step.
-				disImg.create(kFrameSize, kFrameSize, CV_8UC3);
-				const int srcCols = grayFull.cols, srcRows = grayFull.rows;
-				for (int r = 0; r < kFrameSize; ++r)
-					for (int c = 0; c < kFrameSize; ++c)
-					{
-						const Point2f sp = mapPt(static_cast<float>(c), static_cast<float>(r));
-						const int cx0 = static_cast<int>(sp.x + 0.5f);
-						const int cy0 = static_cast<int>(sp.y + 0.5f);
-						int white = 0, total = 0;
-						for (int dy = -halfR; dy <= halfR; ++dy)
-							for (int dx = -halfR; dx <= halfR; ++dx)
-							{
-								const int px = std::max(0, std::min(srcCols - 1, cx0 + dx));
-								const int py = std::max(0, std::min(srcRows - 1, cy0 + dy));
-								if (grayFull.at<uint8_t>(py, px) > static_cast<uint8_t>(otsuThresh))
-									++white;
-								++total;
-							}
-						disImg.at<Vec3b>(r, c) = (white * 2 >= total)
-							? Vec3b(255, 255, 255) : Vec3b(0, 0, 0);
-					}
+				// Step 2: resize to 266×266 with INTER_AREA (proportional voting).
+				Mat resized266;
+				resize(warped, resized266, Size(kFrameSize, kFrameSize), 0, 0, INTER_AREA);
+
+				// Step 3: Otsu threshold → output as CV_8UC3.
+				Mat bin;
+				threshold(resized266, bin, 0, 255, THRESH_BINARY | THRESH_OTSU);
+
+				cvtColor(bin, disImg, COLOR_GRAY2BGR);
 				return true;
 			};
 
-		auto useCached = [&]() -> bool
-			{
-				if (g_lastValidTransform.empty()) return false;
-				return warpColor(g_lastValidTransform);
-			};
-
-		// Try detection without HSV assist, then with (from modify/pic.cpp).
+		// Try detection without HSV assist, then with.
 		const int passes = (srcImg.channels() == 3) ? 2 : 1;
 		for (int pass = 0; pass < passes; ++pass)
 		{
@@ -312,19 +288,15 @@ namespace ImgParse
 			if (!locateCorners(srcImg, pass == 1, tl, tr, br, bl))
 				continue;
 
-			// Build perspective transform using the corrected dst points (per warp_engine.cpp convention).
-			const vector<Point2f> srcPts = { tl, tr, br, bl };
-			const vector<Point2f> dstPts = {
-				Point2f(21.0f, 21.0f),
-				Point2f(245.0f, 21.0f),
-				Point2f(253.5f, 253.5f),
-				Point2f(21.0f, 245.0f)
-			};
-			const Mat M = getPerspectiveTransform(srcPts, dstPts);
-			g_lastValidTransform = M.clone();
-			return warpColor(M);
+			g_cachedCorners = { tl, tr, br, bl, true };
+			return warpBW(tl, tr, br, bl);
 		}
 
-		return useCached();
+		// Fall back to cached corners from the previous successful frame.
+		if (g_cachedCorners.valid)
+			return warpBW(g_cachedCorners.tl, g_cachedCorners.tr,
+				g_cachedCorners.br, g_cachedCorners.bl);
+
+		return false;
 	}
 } // namespace ImgParse
