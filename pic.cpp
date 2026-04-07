@@ -203,15 +203,30 @@ namespace ImgParse
 			g_lastValidTransform = Mat();
 		}
 
-		// Square-input fast path: direct Otsu resize (from modify/pic.cpp).
+		// Square-input fast path: direct binarise + resize (from modify/pic.cpp).
 		const double aspect = static_cast<double>(srcImg.cols) / srcImg.rows;
 		if (aspect > 0.95 && aspect < 1.05 && srcImg.cols > 200)
 		{
 			Mat imgGray;
 			if (srcImg.channels() == 3) cvtColor(srcImg, imgGray, COLOR_BGR2GRAY);
 			else                        imgGray = srcImg.clone();
+			// Adaptive threshold via pic108 GetVec: sample a corner patch to find
+			// (min+max)/2 as the split point.  This is robust when the histogram is
+			// not perfectly bimodal and avoids Otsu choosing an off-centre threshold.
+			// THRESH_BINARY preserves encoder semantics: bright pixel = bit-1.
+			const int sr = std::min(90, imgGray.rows - 10);
+			const int sc = std::min(90, imgGray.cols - 10);
+			uint8_t lo = 255, hi = 0;
+			for (int r = 10; r < 10 + sr; ++r)
+				for (int c = 10; c < 10 + sc; ++c)
+				{
+					const uint8_t v = imgGray.at<uint8_t>(r, c);
+					if (v < lo) lo = v;
+					if (v > hi) hi = v;
+				}
+			const double adaptThresh = (static_cast<double>(lo) + hi) / 2.0;
 			Mat binRaw;
-			threshold(imgGray, binRaw, 0, 255, THRESH_BINARY_INV | THRESH_OTSU);
+			threshold(imgGray, binRaw, adaptThresh, 255, THRESH_BINARY);
 			disImg.create(kFrameSize, kFrameSize, CV_8UC3);
 			const float stepX = static_cast<float>(srcImg.cols) / kFrameSize;
 			const float stepY = static_cast<float>(srcImg.rows) / kFrameSize;
@@ -253,15 +268,27 @@ namespace ImgParse
 				Mat blurredFull;
 				medianBlur(grayFull, blurredFull, medSz);
 
-				// Step 3: binarize at full resolution using global Otsu threshold.
-				//         Otsu finds the optimal split between the dark-cell and
-				//         bright-cell peaks of the bimodal screen histogram.
-				//         Doing this BEFORE the warp avoids the gray border pixels
-				//         that INTER_AREA downsampling introduces, which would
-				//         skew Otsu toward the white end at 266×266.
-				//         This mirrors the square fast-path (THRESH_BINARY_INV | THRESH_OTSU).
+				// Step 3: binarize at full resolution using adaptive sample-based threshold.
+				//         Following pic108 GetVec: sample a corner patch of the blurred image
+				//         to compute (min+max)/2 as the threshold.  This avoids Otsu choosing
+				//         an off-centre split when the histogram is skewed (e.g. when the barcode
+				//         occupies only a small portion of the frame).
+				//         THRESH_BINARY preserves encoder semantics: bright pixel = bit-1.
 				Mat binFull;
-				threshold(blurredFull, binFull, 0, 255, THRESH_BINARY_INV | THRESH_OTSU);
+				{
+					const int sr = std::min(90, blurredFull.rows - 10);
+					const int sc = std::min(90, blurredFull.cols - 10);
+					uint8_t lo = 255, hi = 0;
+					for (int r = 10; r < 10 + sr; ++r)
+						for (int c = 10; c < 10 + sc; ++c)
+						{
+							const uint8_t v = blurredFull.at<uint8_t>(r, c);
+							if (v < lo) lo = v;
+							if (v > hi) hi = v;
+						}
+					const double adaptThresh = (static_cast<double>(lo) + hi) / 2.0;
+					threshold(blurredFull, binFull, adaptThresh, 255, THRESH_BINARY);
+				}
 
 				// Step 4: warp the binary image to 266×266 with INTER_NEAREST
 				//         (following warp_engine.cpp). Since binFull is pure 0/255,
