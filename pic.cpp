@@ -211,7 +211,7 @@ namespace ImgParse
 			if (srcImg.channels() == 3) cvtColor(srcImg, imgGray, COLOR_BGR2GRAY);
 			else                        imgGray = srcImg.clone();
 			Mat binRaw;
-			threshold(imgGray, binRaw, 0, 255, THRESH_BINARY | THRESH_OTSU);
+			threshold(imgGray, binRaw, 0, 255, THRESH_BINARY_INV | THRESH_OTSU);
 			disImg.create(kFrameSize, kFrameSize, CV_8UC3);
 			const float stepX = static_cast<float>(srcImg.cols) / kFrameSize;
 			const float stepY = static_cast<float>(srcImg.rows) / kFrameSize;
@@ -235,21 +235,42 @@ namespace ImgParse
 
 		auto warpColor = [&](const Mat& M) -> bool
 			{
-				Mat warped;
-				warpPerspective(srcImg, warped, M, Size(kFrameSize, kFrameSize), INTER_LINEAR);
-				// Otsu binarize: same method as the square fast-path, produces clean black/white
-				// output for ImageDecode and eliminates moiré from the ~7x downscale.
-				Mat warpedGray;
-				cvtColor(warped, warpedGray, COLOR_BGR2GRAY);
-				Mat binRaw;
-				threshold(warpedGray, binRaw, 0, 255, THRESH_BINARY | THRESH_OTSU);
-				disImg.create(kFrameSize, kFrameSize, CV_8UC3);
-				for (int r = 0; r < kFrameSize; ++r)
-					for (int c = 0; c < kFrameSize; ++c)
-					{
-						const uint8_t val = binRaw.at<uint8_t>(r, c);
-						disImg.at<Vec3b>(r, c) = val ? Vec3b(255, 255, 255) : Vec3b(0, 0, 0);
-					}
+				// Step 1: convert to grayscale.
+				Mat grayFull;
+				if (srcImg.channels() == 3) cvtColor(srcImg, grayFull, COLOR_BGR2GRAY);
+				else                        grayFull = srcImg.clone();
+
+				// Step 2: suppress moire with a median blur.
+				//         Median blur removes periodic interference (moire) without
+				//         blurring the gradients that Gaussian blur would introduce.
+				//         Unlike Gaussian, median produces no gray halos, so the
+				//         subsequent large-window adaptive threshold cannot form ring
+				//         artifacts.  A 3-pixel kernel (scaled to image size, always odd)
+				//         eliminates moire cycles while preserving cell boundaries.
+				const int maxDim = std::max(srcImg.cols, srcImg.rows);
+				int medSz = std::max(3, static_cast<int>(maxDim * 3.0 / 1920.0));
+				if (medSz % 2 == 0) ++medSz;
+				Mat blurredFull;
+				medianBlur(grayFull, blurredFull, medSz);
+
+				// Step 3: binarize at full resolution using global Otsu threshold.
+				//         Otsu finds the optimal split between the dark-cell and
+				//         bright-cell peaks of the bimodal screen histogram.
+				//         Doing this BEFORE the warp avoids the gray border pixels
+				//         that INTER_AREA downsampling introduces, which would
+				//         skew Otsu toward the white end at 266×266.
+				//         This mirrors the square fast-path (THRESH_BINARY_INV | THRESH_OTSU).
+				Mat binFull;
+				threshold(blurredFull, binFull, 0, 255, THRESH_BINARY_INV | THRESH_OTSU);
+
+				// Step 4: warp the binary image to 266×266 with INTER_NEAREST
+				//         (following warp_engine.cpp). Since binFull is pure 0/255,
+				//         INTER_NEAREST keeps values clean — no gray transitions to
+				//         confuse the decoder's isWhiteCell threshold.
+				Mat warped266;
+				warpPerspective(binFull, warped266, M, Size(kFrameSize, kFrameSize), INTER_NEAREST);
+
+				cvtColor(warped266, disImg, COLOR_GRAY2BGR);
 				return true;
 			};
 
