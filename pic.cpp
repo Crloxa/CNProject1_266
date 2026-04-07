@@ -13,13 +13,14 @@ namespace ImgParse
 	namespace
 	{
 		constexpr int kFrameSize = 266;
-		constexpr float kFinderCenter = 21.0f;                 // center of each large 42x42 finder marker (index 12-15 ring: col/row 6..36, centroid=21)
-		constexpr float kOppositeFinderCenter = 245.0f;        // 266 - 21: center of TR/BL large markers
-		constexpr float kSmallFinderCenter = 252.5f;           // center of the small BR marker in logical frame: (SmallQrPointStart+SmallQrPointEnd)/2 = (246+259)/2
-		constexpr float kMaxDetectionDimension = 800.0f;       // always resize to this before detection (same as modify/warp_engine)
-		constexpr int kDetectAdaptiveBlock = 101;              // tuned for 800px images (matches modify/warp_engine.cpp)
-		constexpr double kDetectMinArea = 500.0;               // tuned for 800px images (matches modify/warp_engine.cpp)
-		constexpr float kDetectMergeDistance = 100.0f;         // tuned for 800px images (matches modify/warp_engine.cpp)
+		constexpr float kFinderCenter = 21.0f;                 // TL/TR/BL large marker center in output frame
+		constexpr float kOppositeFinderCenter = 245.0f;        // TR/BL large marker center in output frame
+		constexpr float kBRFinderCenter = 253.5f;              // BR marker center in output frame
+		// Detection parameters tuned at 800px; scaled proportionally for other resolutions.
+		constexpr float kRefDimension = 800.0f;
+		constexpr int kRefAdaptiveBlock = 101;
+		constexpr double kRefMinArea = 500.0;
+		constexpr float kRefMergeDistance = 100.0f;
 		constexpr int kThresholdBlockSize = 19;
 		constexpr int kThresholdBias = 10;
 
@@ -33,6 +34,17 @@ namespace ImgParse
 
 		vector<Marker> findMarkerCenters(const Mat& input)
 		{
+			// Scale detection parameters proportionally to image size relative to the
+			// reference resolution at which they were tuned (800px).
+			const int maxDim = std::max(input.cols, input.rows);
+			int adaptiveBlock = std::max(21, static_cast<int>(static_cast<double>(maxDim) * kRefAdaptiveBlock / kRefDimension));
+			if ((adaptiveBlock & 1) == 0)
+			{
+				++adaptiveBlock;
+			}
+			const double minArea = std::max(50.0, static_cast<double>(maxDim) * maxDim * kRefMinArea / (kRefDimension * kRefDimension));
+			const float mergeDistance = std::max(15.0f, static_cast<float>(maxDim) * kRefMergeDistance / kRefDimension);
+
 			Mat gray;
 			if (input.channels() == 3)
 			{
@@ -51,7 +63,7 @@ namespace ImgParse
 			}
 
 			Mat binary;
-			adaptiveThreshold(gray, binary, 255, ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY_INV, kDetectAdaptiveBlock, 15);
+			adaptiveThreshold(gray, binary, 255, ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY_INV, adaptiveBlock, 15);
 			Mat kernel = getStructuringElement(MORPH_CROSS, Size(2, 2));
 			Mat closedBinary;
 			morphologyEx(binary, closedBinary, MORPH_CLOSE, kernel);
@@ -77,7 +89,7 @@ namespace ImgParse
 				if (nested >= 2)
 				{
 					const Moments mu = moments(contours[i], false);
-					if (mu.m00 >= kDetectMinArea)
+					if (mu.m00 >= minArea)
 					{
 						const Point2f markerCenter(
 							static_cast<float>(mu.m10 / mu.m00),
@@ -94,7 +106,7 @@ namespace ImgParse
 				bool isNew = true;
 				for (auto& m : merged)
 				{
-					if (norm(pt.center - m.center) < kDetectMergeDistance)
+					if (norm(pt.center - m.center) < mergeDistance)
 					{
 						isNew = false;
 						if (pt.area > m.area)
@@ -245,20 +257,9 @@ namespace ImgParse
 			return false;
 		}
 
-		// Always scale to exactly kMaxDetectionDimension (800px) for detection — matching
-		// modify/warp_engine.cpp. This ensures fixed params (block=101, minArea=500, etc.)
-		// work correctly for all input sizes, including sub-800px inputs that need upscaling.
-		const float scale = kMaxDetectionDimension / static_cast<float>(std::max(srcImg.cols, srcImg.rows));
-		Mat smallImg;
-		resize(srcImg, smallImg, Size(), scale, scale, scale > 1.0f ? INTER_LINEAR : INTER_AREA);
-
-		vector<Marker> smallMarkers = findMarkerCenters(smallImg);
-		vector<Marker> markers;
-		markers.reserve(smallMarkers.size());
-		for (const auto& pt : smallMarkers)
-		{
-			markers.push_back({ Point2f(pt.center.x / scale, pt.center.y / scale), pt.area });
-		}
+		// Detect directly on the original image; findMarkerCenters scales its own
+		// parameters to the actual image size.
+		vector<Marker> markers = findMarkerCenters(srcImg);
 
 		auto useCached = [&]() -> bool
 		{
@@ -277,9 +278,7 @@ namespace ImgParse
 			return useCached();
 		}
 
-		// Sort by area descending. The 3 largest are the big 42x42 finder markers (TL, TR, BL).
-		// This mirrors the V15process approach: always anchor on the three large structural markers,
-		// ignoring smaller candidates that can flicker frame-to-frame and cause tearing.
+		// Sort by area descending; take the 3 largest (the stable 42x42 large markers).
 		sort(markers.begin(), markers.end(), [](const Marker& a, const Marker& b)
 		{
 			return a.area > b.area;
@@ -293,38 +292,13 @@ namespace ImgParse
 		}
 
 		// srcPoints: [0]=TL, [1]=TR, [2]=estimated BR (parallelogram TR+BL-TL), [3]=BL.
-		// Optionally refine the BR point: look for a small marker (area significantly below the
-		// large ones) that lies within 35% of the TL-TR side length from the estimated BR position.
-		// 35% covers the geometric offset between the parallelogram estimate and the actual small
-		// marker position, plus typical detection noise, without accepting distant false positives.
-		const float searchRadius = static_cast<float>(norm(srcPoints[1] - srcPoints[0])) * 0.35f;
-		// Reject any candidate whose area is more than half that of the smallest large marker;
-		// the small BR finder pattern (14x14 logical) is at most ~1/9 the area of a large one (42x42),
-		// so 0.5 comfortably separates small from large while tolerating detection variation.
-		const float maxSmallArea = largeMarkers[2].area * 0.5f;
-		bool foundSmallBR = false;
-		for (size_t i = 3; i < markers.size(); ++i)
-		{
-			if (markers[i].area > maxSmallArea)
-			{
-				continue;
-			}
-			const float dist = static_cast<float>(norm(markers[i].center - srcPoints[2]));
-			if (dist < searchRadius)
-			{
-				srcPoints[2] = markers[i].center;
-				foundSmallBR = true;
-				break;
-			}
-		}
-
-		const float brDstCoord = foundSmallBR ? kSmallFinderCenter : kOppositeFinderCenter;
+		// dst points match the logical 266x266 frame layout exactly as specified.
 		const array<Point2f, 4> dstPoints =
 		{ {
-			Point2f(kFinderCenter, kFinderCenter),
+			Point2f(kFinderCenter,         kFinderCenter),
 			Point2f(kOppositeFinderCenter, kFinderCenter),
-			Point2f(brDstCoord, brDstCoord),
-			Point2f(kFinderCenter, kOppositeFinderCenter)
+			Point2f(kBRFinderCenter,       kBRFinderCenter),
+			Point2f(kFinderCenter,         kOppositeFinderCenter)
 		} };
 
 		const Mat transform = getPerspectiveTransform(srcPoints.data(), dstPoints.data());
