@@ -31,7 +31,6 @@ namespace ImgParse
 		Mat g_lastValidTransform;
 		int g_lastCols = 0;
 		int g_lastRows = 0;
-		int g_frameCount = 0;
 
 		// Find the child contour of parentIdx with the largest area (from modify/pic.cpp).
 		int findLargestChild(int parentIdx,
@@ -261,7 +260,6 @@ namespace ImgParse
 		{
 			g_lastCols = srcImg.cols;
 			g_lastRows = srcImg.rows;
-			g_frameCount = 0;
 			g_lastValidTransform = Mat();
 		}
 
@@ -288,25 +286,12 @@ namespace ImgParse
 			return true;
 		}
 
-		// Warmup: skip the first few frames until detection is stable (from modify/pic.cpp).
-		if (g_frameCount < 3)
-		{
-			++g_frameCount;
-			return false;
-		}
-
 		auto warpAndThreshold = [&](const Mat& M) -> bool
 			{
 				Mat warped;
 				warpPerspective(srcImg, warped, M, Size(kFrameSize, kFrameSize), INTER_NEAREST);
 				blockwiseColorMaxAdaptiveThreshold(warped, disImg);
 				return true;
-			};
-
-		auto useCached = [&]() -> bool
-			{
-				if (g_lastValidTransform.empty()) return false;
-				return warpAndThreshold(g_lastValidTransform);
 			};
 
 		// Try detection without HSV assist, then with (from modify/pic.cpp).
@@ -330,6 +315,6 @@ namespace ImgParse
 			return warpAndThreshold(M);
 		}
 
-		return useCached();
+		return false;
 	}
 } // namespace ImgParse
