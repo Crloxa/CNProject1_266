@@ -265,29 +265,6 @@ namespace ImgParse
 			g_lastValidTransform = Mat();
 		}
 
-		// Square-input fast path: direct Otsu resize (from modify/pic.cpp).
-		const double aspect = static_cast<double>(srcImg.cols) / srcImg.rows;
-		if (aspect > 0.95 && aspect < 1.05 && srcImg.cols > 200)
-		{
-			Mat imgGray;
-			if (srcImg.channels() == 3) cvtColor(srcImg, imgGray, COLOR_BGR2GRAY);
-			else                        imgGray = srcImg.clone();
-			Mat binRaw;
-			threshold(imgGray, binRaw, 0, 255, THRESH_BINARY | THRESH_OTSU);
-			disImg.create(kFrameSize, kFrameSize, CV_8UC3);
-			const float stepX = static_cast<float>(srcImg.cols) / kFrameSize;
-			const float stepY = static_cast<float>(srcImg.rows) / kFrameSize;
-			for (int r = 0; r < kFrameSize; ++r)
-				for (int c = 0; c < kFrameSize; ++c)
-				{
-					const int px = std::min(static_cast<int>((c + 0.5f) * stepX), srcImg.cols - 1);
-					const int py = std::min(static_cast<int>((r + 0.5f) * stepY), srcImg.rows - 1);
-					const uint8_t val = binRaw.at<uint8_t>(py, px);
-					disImg.at<Vec3b>(r, c) = val ? Vec3b(255, 255, 255) : Vec3b(0, 0, 0);
-				}
-			return true;
-		}
-
 		// Warmup: skip the first few frames until detection is stable (from modify/pic.cpp).
 		if (g_frameCount < 3)
 		{
