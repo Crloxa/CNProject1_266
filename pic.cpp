@@ -234,6 +234,15 @@ namespace ImgParse
 			return false;
 		}
 
+		// Grid constants: the barcode is a 133×133 cell grid.
+		// Finder-marker centres land at cell 21 (TL/TR/BL) and cell ~253.5 (BR).
+		// kFinderSpan is the cell distance between TL and TR/BL finder centres (112 cells).
+		constexpr float kMarkerTL    = 21.0f;   // finder centre position (TL, TR, BL axes)
+		constexpr float kMarkerTR    = 245.0f;  // finder centre position (TR col, BL row)
+		constexpr float kMarkerBR    = 253.5f;  // finder centre position for BR corner
+		constexpr int   kBarcodeGrid = 133;     // full grid dimension in cells
+		constexpr int   kFinderSpan  = 112;     // finder-centre-to-finder-centre distance
+
 		// Forward-warp approach (reference: pic_color.cpp):
 		// 1. Warp original grayscale to the barcode's natural pixel size (targetSize).
 		// 2. Resize to 266×266 with INTER_AREA — true proportional voting: each output
@@ -246,21 +255,20 @@ namespace ImgParse
 				else                        grayFull = srcImg.clone();
 
 				// Estimate natural barcode side length in source pixels.
-				// Finder-marker centres span 224 pixels of the 266-wide full barcode
-				// (positions 21 and 245), i.e. 112/133 cells.  Multiply by 133/112.
+				// Finder-marker centres are kFinderSpan/kBarcodeGrid of the full barcode.
 				const double edgeLen = std::min(norm(tr - tl), norm(bl - tl));
 				const int targetSize = std::max(kFrameSize,
-					static_cast<int>(std::round(edgeLen * 133.0 / 112.0)));
+					static_cast<int>(std::round(edgeLen * kBarcodeGrid / kFinderSpan)));
 
 				const float k = static_cast<float>(targetSize) / kFrameSize;
 
 				// Build transform: finder-marker centres → scaled positions in targetSize space.
 				const vector<Point2f> srcPts = { tl, tr, br, bl };
 				const vector<Point2f> dstPts = {
-					Point2f(21.0f * k, 21.0f * k),
-					Point2f(245.0f * k, 21.0f * k),
-					Point2f(253.5f * k, 253.5f * k),
-					Point2f(21.0f * k, 245.0f * k)
+					Point2f(kMarkerTL * k, kMarkerTL * k),
+					Point2f(kMarkerTR * k, kMarkerTL * k),
+					Point2f(kMarkerBR * k, kMarkerBR * k),
+					Point2f(kMarkerTL * k, kMarkerTR * k)
 				};
 				const Mat M = getPerspectiveTransform(srcPts, dstPts);
 
