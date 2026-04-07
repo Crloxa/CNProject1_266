@@ -11,16 +11,16 @@ namespace ImgParse
 
 	namespace
 	{
-		constexpr int   kFrameSize        = 266;
-		constexpr int   kGridSize         = 266;
-		constexpr int   kQuietZone        = 0;
-		constexpr int   kLargeFinder      = 42;
+		constexpr int   kFrameSize = 266;
+		constexpr int   kGridSize = 266;
+		constexpr int   kQuietZone = 0;
+		constexpr int   kLargeFinder = 42;
 		// r_min = (quiet_zone + large_finder/2) / (grid_size + 2*quiet_zone) = 21/266
 		// r_max = (logic_total_width - center_offset) / logic_total_width    = 245/266
-		constexpr float kRMin             = (kQuietZone + kLargeFinder / 2.0f) / (kGridSize + 2.0f * kQuietZone);
-		constexpr float kRMax             = 1.0f - kRMin;
-		constexpr int   kThresholdBlock   = 19;
-		constexpr int   kThresholdBias    = 10;
+		constexpr float kRMin = (kQuietZone + kLargeFinder / 2.0f) / (kGridSize + 2.0f * kQuietZone);
+		constexpr float kRMax = 1.0f - kRMin;
+		constexpr int   kThresholdBlock = 19;
+		constexpr int   kThresholdBias = 10;
 
 		struct Marker
 		{
@@ -29,18 +29,18 @@ namespace ImgParse
 		};
 
 		Mat g_lastValidTransform;
-		int g_lastCols     = 0;
-		int g_lastRows     = 0;
-		int g_frameCount   = 0;
+		int g_lastCols = 0;
+		int g_lastRows = 0;
+		int g_frameCount = 0;
 
 		// Find the child contour of parentIdx with the largest area (from modify/pic.cpp).
 		int findLargestChild(int parentIdx,
-		                     const vector<vector<Point>>& contours,
-		                     const vector<Vec4i>& hierarchy)
+			const vector<vector<Point>>& contours,
+			const vector<Vec4i>& hierarchy)
 		{
-			int    maxIdx  = -1;
+			int    maxIdx = -1;
 			double maxArea = -1.0;
-			int    child   = hierarchy[parentIdx][2];
+			int    child = hierarchy[parentIdx][2];
 			while (child >= 0)
 			{
 				const double a = contourArea(contours[child]);
@@ -53,8 +53,8 @@ namespace ImgParse
 		// Block-wise RGB-max adaptive threshold binarisation (from modify/pic.cpp).
 		void blockwiseColorMaxAdaptiveThreshold(const Mat& imgColor, Mat& binImg)
 		{
-			const int H       = imgColor.rows;
-			const int W       = imgColor.cols;
+			const int H = imgColor.rows;
+			const int W = imgColor.cols;
 			const int nBlockY = (H + kThresholdBlock - 1) / kThresholdBlock;
 			const int nBlockX = (W + kThresholdBlock - 1) / kThresholdBlock;
 			vector<vector<int>> thresholds(nBlockY, vector<int>(nBlockX, 128));
@@ -78,8 +78,8 @@ namespace ImgParse
 					if (!values.empty())
 					{
 						sort(values.begin(), values.end());
-						const int n       = static_cast<int>(values.size());
-						const int lowIdx  = n / 10;
+						const int n = static_cast<int>(values.size());
+						const int lowIdx = n / 10;
 						const int highIdx = n - n / 10 - 1;
 						int thres = (values[lowIdx] + values[highIdx]) / 2 + kThresholdBias;
 						thres = std::max(0, std::min(255, thres));
@@ -94,11 +94,11 @@ namespace ImgParse
 				const int by = y / kThresholdBlock;
 				for (int x = 0; x < W; ++x)
 				{
-					const int bx  = x / kThresholdBlock;
+					const int bx = x / kThresholdBlock;
 					const Vec3b p = imgColor.at<Vec3b>(y, x);
 					const int   mx = std::max(p[0], std::max(p[1], p[2]));
 					binImg.at<Vec3b>(y, x) = (mx > thresholds[by][bx])
-					                         ? Vec3b(255, 255, 255) : Vec3b(0, 0, 0);
+						? Vec3b(255, 255, 255) : Vec3b(0, 0, 0);
 				}
 			}
 		}
@@ -107,7 +107,7 @@ namespace ImgParse
 		// from modify/pic.cpp (3-ring nested contour detection + geometry validation).
 		// useHSV: also suppress saturated-colour regions (same as modify/pic.cpp).
 		bool locateCorners(const Mat& srcImg, bool useHSV,
-		                   Point2f& tl, Point2f& tr, Point2f& br, Point2f& bl)
+			Point2f& tl, Point2f& tr, Point2f& br, Point2f& bl)
 		{
 			Mat gray;
 			if (srcImg.channels() == 3)
@@ -137,7 +137,7 @@ namespace ImgParse
 			if (blockSz % 2 == 0) ++blockSz;
 			Mat binary;
 			adaptiveThreshold(blurred, binary, 255,
-			                  ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY_INV, blockSz, 10);
+				ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY_INV, blockSz, 10);
 
 			Mat kernel = getStructuringElement(MORPH_CROSS, Size(2, 2));
 			Mat closedBinary;
@@ -147,8 +147,8 @@ namespace ImgParse
 			vector<Vec4i>         hierarchy;
 			findContours(closedBinary, contours, hierarchy, RETR_TREE, CHAIN_APPROX_SIMPLE);
 
-			const double minArea    = std::max(15.0, static_cast<double>(maxDim) * maxDim * 0.000004);
-			const double mergeDist  = std::max(15.0, static_cast<double>(maxDim) * 0.0078);
+			const double minArea = std::max(15.0, static_cast<double>(maxDim) * maxDim * 0.000004);
+			const double mergeDist = std::max(15.0, static_cast<double>(maxDim) * 0.0078);
 
 			vector<Marker> markers;
 			for (size_t i = 0; i < contours.size(); ++i)
@@ -168,7 +168,7 @@ namespace ImgParse
 					const Moments mu = moments(contours[i]);
 					if (mu.m00 != 0)
 						markers.push_back({ Point2f(static_cast<float>(mu.m10 / mu.m00),
-						                            static_cast<float>(mu.m01 / mu.m00)), a0 });
+													static_cast<float>(mu.m01 / mu.m00)), a0 });
 				}
 			}
 
@@ -194,10 +194,10 @@ namespace ImgParse
 
 			// Sort by area descending; the three largest are the structural finders.
 			std::sort(markers.begin(), markers.end(),
-			          [](const Marker& a, const Marker& b) { return a.area > b.area; });
+				[](const Marker& a, const Marker& b) { return a.area > b.area; });
 
 			// The marker farthest from its two neighbours (i.e. at the right-angle corner) is TL.
-			double maxDist   = 0.0;
+			double maxDist = 0.0;
 			int    rightAngleIdx = -1;
 			for (int i = 0; i < 3; ++i)
 				for (int j = i + 1; j < 3; ++j)
@@ -207,11 +207,11 @@ namespace ImgParse
 				}
 
 			const Point2f tlCand = markers[rightAngleIdx].center;
-			const Point2f pt1    = markers[(rightAngleIdx + 1) % 3].center;
-			const Point2f pt2    = markers[(rightAngleIdx + 2) % 3].center;
+			const Point2f pt1 = markers[(rightAngleIdx + 1) % 3].center;
+			const Point2f pt2 = markers[(rightAngleIdx + 2) % 3].center;
 
-			const Point2f v1   = pt1 - tlCand;
-			const Point2f v2   = pt2 - tlCand;
+			const Point2f v1 = pt1 - tlCand;
+			const Point2f v2 = pt2 - tlCand;
 			const double  len1 = norm(v1);
 			const double  len2 = norm(v2);
 
@@ -225,15 +225,15 @@ namespace ImgParse
 			const double cross = v1.x * v2.y - v1.y * v2.x;
 			Point2f trCand, blCand;
 			if (cross > 0) { trCand = pt1; blCand = pt2; }
-			else           { trCand = pt2; blCand = pt1; }
+			else { trCand = pt2; blCand = pt1; }
 
 			// BR: use the detected 4th marker if close to the parallelogram prediction,
 			// otherwise estimate it.
-			Point2f brCand     = trCand + blCand - tlCand;
+			Point2f brCand = trCand + blCand - tlCand;
 			const double maxLeg = std::max(len1, len2);
 			if (markers.size() > 3)
 			{
-				double minD    = 1e9;
+				double minD = 1e9;
 				int    bestIdx = -1;
 				for (size_t i = 3; i < markers.size(); ++i)
 				{
@@ -259,10 +259,33 @@ namespace ImgParse
 		// Reset cached transform when input resolution changes (from modify/pic.cpp).
 		if (srcImg.cols != g_lastCols || srcImg.rows != g_lastRows)
 		{
-			g_lastCols   = srcImg.cols;
-			g_lastRows   = srcImg.rows;
+			g_lastCols = srcImg.cols;
+			g_lastRows = srcImg.rows;
 			g_frameCount = 0;
 			g_lastValidTransform = Mat();
+		}
+
+		// Square-input fast path: direct Otsu resize (from modify/pic.cpp).
+		const double aspect = static_cast<double>(srcImg.cols) / srcImg.rows;
+		if (aspect > 0.95 && aspect < 1.05 && srcImg.cols > 200)
+		{
+			Mat imgGray;
+			if (srcImg.channels() == 3) cvtColor(srcImg, imgGray, COLOR_BGR2GRAY);
+			else                        imgGray = srcImg.clone();
+			Mat binRaw;
+			threshold(imgGray, binRaw, 0, 255, THRESH_BINARY | THRESH_OTSU);
+			disImg.create(kFrameSize, kFrameSize, CV_8UC3);
+			const float stepX = static_cast<float>(srcImg.cols) / kFrameSize;
+			const float stepY = static_cast<float>(srcImg.rows) / kFrameSize;
+			for (int r = 0; r < kFrameSize; ++r)
+				for (int c = 0; c < kFrameSize; ++c)
+				{
+					const int px = std::min(static_cast<int>((c + 0.5f) * stepX), srcImg.cols - 1);
+					const int py = std::min(static_cast<int>((r + 0.5f) * stepY), srcImg.rows - 1);
+					const uint8_t val = binRaw.at<uint8_t>(py, px);
+					disImg.at<Vec3b>(r, c) = val ? Vec3b(255, 255, 255) : Vec3b(0, 0, 0);
+				}
+			return true;
 		}
 
 		// Warmup: skip the first few frames until detection is stable (from modify/pic.cpp).
@@ -273,18 +296,18 @@ namespace ImgParse
 		}
 
 		auto warpAndThreshold = [&](const Mat& M) -> bool
-		{
-			Mat warped;
-			warpPerspective(srcImg, warped, M, Size(kFrameSize, kFrameSize), INTER_NEAREST);
-			blockwiseColorMaxAdaptiveThreshold(warped, disImg);
-			return true;
-		};
+			{
+				Mat warped;
+				warpPerspective(srcImg, warped, M, Size(kFrameSize, kFrameSize), INTER_NEAREST);
+				blockwiseColorMaxAdaptiveThreshold(warped, disImg);
+				return true;
+			};
 
 		auto useCached = [&]() -> bool
-		{
-			if (g_lastValidTransform.empty()) return false;
-			return warpAndThreshold(g_lastValidTransform);
-		};
+			{
+				if (g_lastValidTransform.empty()) return false;
+				return warpAndThreshold(g_lastValidTransform);
+			};
 
 		// Try detection without HSV assist, then with (from modify/pic.cpp).
 		const int passes = (srcImg.channels() == 3) ? 2 : 1;
