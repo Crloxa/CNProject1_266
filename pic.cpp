@@ -253,16 +253,15 @@ namespace ImgParse
 				Mat blurredFull;
 				medianBlur(grayFull, blurredFull, medSz);
 
-				// Step 3: binarize at full resolution with adaptive threshold (local contrast).
-				//         Doing this BEFORE the warp (like warp_engine.cpp) avoids the
-				//         "too-much-white" Otsu bias that occurs after INTER_AREA averaging
-				//         produces gray border pixels at reduced resolution.
-				//         blockSz scales with image size; C=15 matches warp_engine.cpp.
-				int binBlockSz = std::max(101, static_cast<int>(maxDim * 101.0 / 1920.0));
-				if (binBlockSz % 2 == 0) ++binBlockSz;
+				// Step 3: binarize at full resolution using global Otsu threshold.
+				//         Otsu finds the optimal split between the dark-cell and
+				//         bright-cell peaks of the bimodal screen histogram.
+				//         Doing this BEFORE the warp avoids the gray border pixels
+				//         that INTER_AREA downsampling introduces, which would
+				//         skew Otsu toward the white end at 266×266.
+				//         This mirrors the square fast-path (THRESH_BINARY | THRESH_OTSU).
 				Mat binFull;
-				adaptiveThreshold(blurredFull, binFull, 255,
-					ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY, binBlockSz, 15);
+				threshold(blurredFull, binFull, 0, 255, THRESH_BINARY | THRESH_OTSU);
 
 				// Step 4: warp the binary image to 266×266 with INTER_NEAREST
 				//         (following warp_engine.cpp). Since binFull is pure 0/255,
