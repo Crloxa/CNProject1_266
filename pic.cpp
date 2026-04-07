@@ -1,7 +1,6 @@
 #include "pic.h"
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <vector>
 
@@ -12,142 +11,75 @@ namespace ImgParse
 
 	namespace
 	{
-		constexpr int kFrameSize = 266;
-		constexpr int kGridSize = 266;                         // logical data grid size in output pixels
-		constexpr int kQuietZone = 0;                          // quiet zone width in output pixels
-		constexpr int kLargeFinder = 42;                       // large finder marker size in output pixels
+		constexpr int   kFrameSize        = 266;
+		constexpr int   kGridSize         = 266;
+		constexpr int   kQuietZone        = 0;
+		constexpr int   kLargeFinder      = 42;
 		// r_min = (quiet_zone + large_finder/2) / (grid_size + 2*quiet_zone) = 21/266
-		// r_max = 1 - r_min = 245/266
-		// dst corners are symmetric: TL=(r_min,r_min), TR=(r_max,r_min), BR=(r_max,r_max), BL=(r_min,r_max)
-		constexpr float kRMin = (kQuietZone + kLargeFinder / 2.0f) / (kGridSize + 2.0f * kQuietZone);
-		constexpr float kRMax = 1.0f - kRMin;
-		constexpr float kMaxDetectionDimension = 800.0f;       // always resize to this before detection (same as modify/warp_engine)
-		constexpr int kDetectAdaptiveBlock = 101;              // tuned for 800px images (matches modify/warp_engine.cpp)
-		constexpr double kDetectMinArea = 500.0;               // tuned for 800px images (matches modify/warp_engine.cpp)
-		constexpr float kDetectMergeDistance = 100.0f;         // tuned for 800px images (matches modify/warp_engine.cpp)
-		constexpr int kThresholdBlockSize = 19;
-		constexpr int kThresholdBias = 10;
+		// r_max = (logic_total_width - center_offset) / logic_total_width    = 245/266
+		constexpr float kRMin             = (kQuietZone + kLargeFinder / 2.0f) / (kGridSize + 2.0f * kQuietZone);
+		constexpr float kRMax             = 1.0f - kRMin;
+		constexpr int   kThresholdBlock   = 19;
+		constexpr int   kThresholdBias    = 10;
 
 		struct Marker
 		{
 			Point2f center;
-			float area;
+			double  area;
 		};
 
 		Mat g_lastValidTransform;
+		int g_lastCols     = 0;
+		int g_lastRows     = 0;
+		int g_frameCount   = 0;
 
-		vector<Marker> findMarkerCenters(const Mat& input)
+		// Find the child contour of parentIdx with the largest area (from modify/pic.cpp).
+		int findLargestChild(int parentIdx,
+		                     const vector<vector<Point>>& contours,
+		                     const vector<Vec4i>& hierarchy)
 		{
-			Mat gray;
-			if (input.channels() == 3)
+			int    maxIdx  = -1;
+			double maxArea = -1.0;
+			int    child   = hierarchy[parentIdx][2];
+			while (child >= 0)
 			{
-				Mat hsv;
-				cvtColor(input, hsv, COLOR_BGR2HSV);
-				cvtColor(input, gray, COLOR_BGR2GRAY);
-				vector<Mat> hsvChannels;
-				split(hsv, hsvChannels);
-				Mat saturationMask;
-				threshold(hsvChannels[1], saturationMask, 180, 255, THRESH_BINARY);
-				gray.setTo(255, saturationMask);
+				const double a = contourArea(contours[child]);
+				if (a > maxArea) { maxArea = a; maxIdx = child; }
+				child = hierarchy[child][0];
 			}
-			else
-			{
-				gray = input.clone();
-			}
-
-			Mat binary;
-			adaptiveThreshold(gray, binary, 255, ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY_INV, kDetectAdaptiveBlock, 15);
-			Mat kernel = getStructuringElement(MORPH_CROSS, Size(2, 2));
-			Mat closedBinary;
-			morphologyEx(binary, closedBinary, MORPH_CLOSE, kernel);
-
-			vector<vector<Point>> contours;
-			vector<Vec4i> hierarchy;
-			findContours(closedBinary, contours, hierarchy, RETR_TREE, CHAIN_APPROX_SIMPLE);
-
-			vector<Marker> centers;
-			for (size_t i = 0; i < contours.size(); ++i)
-			{
-				int kid = hierarchy[i][2];
-				int nested = 0;
-				while (kid != -1)
-				{
-					++nested;
-					kid = hierarchy[kid][2];
-					if (nested >= 2)
-					{
-						break;
-					}
-				}
-				if (nested >= 2)
-				{
-					const Moments mu = moments(contours[i], false);
-					if (mu.m00 >= kDetectMinArea)
-					{
-						const Point2f markerCenter(
-							static_cast<float>(mu.m10 / mu.m00),
-							static_cast<float>(mu.m01 / mu.m00)
-						);
-						centers.push_back({ markerCenter, static_cast<float>(mu.m00) });
-					}
-				}
-			}
-
-			vector<Marker> merged;
-			for (const auto& pt : centers)
-			{
-				bool isNew = true;
-				for (auto& m : merged)
-				{
-					if (norm(pt.center - m.center) < kDetectMergeDistance)
-					{
-						isNew = false;
-						if (pt.area > m.area)
-						{
-							m = pt;
-						}
-						break;
-					}
-				}
-				if (isNew)
-				{
-					merged.push_back(pt);
-				}
-			}
-			return merged;
+			return maxIdx;
 		}
 
+		// Block-wise RGB-max adaptive threshold binarisation (from modify/pic.cpp).
 		void blockwiseColorMaxAdaptiveThreshold(const Mat& imgColor, Mat& binImg)
 		{
-			const int H = imgColor.rows;
-			const int W = imgColor.cols;
-			const int nBlockY = (H + kThresholdBlockSize - 1) / kThresholdBlockSize;
-			const int nBlockX = (W + kThresholdBlockSize - 1) / kThresholdBlockSize;
+			const int H       = imgColor.rows;
+			const int W       = imgColor.cols;
+			const int nBlockY = (H + kThresholdBlock - 1) / kThresholdBlock;
+			const int nBlockX = (W + kThresholdBlock - 1) / kThresholdBlock;
 			vector<vector<int>> thresholds(nBlockY, vector<int>(nBlockX, 128));
 
 			for (int by = 0; by < nBlockY; ++by)
 			{
 				for (int bx = 0; bx < nBlockX; ++bx)
 				{
+					const int y0 = by * kThresholdBlock;
+					const int y1 = std::min(y0 + kThresholdBlock, H);
+					const int x0 = bx * kThresholdBlock;
+					const int x1 = std::min(x0 + kThresholdBlock, W);
 					vector<int> values;
-					const int y0 = by * kThresholdBlockSize;
-					const int y1 = std::min(y0 + kThresholdBlockSize, H);
-					const int x0 = bx * kThresholdBlockSize;
-					const int x1 = std::min(x0 + kThresholdBlockSize, W);
 					values.reserve((y1 - y0) * (x1 - x0));
 					for (int y = y0; y < y1; ++y)
-					{
 						for (int x = x0; x < x1; ++x)
 						{
 							const Vec3b pix = imgColor.at<Vec3b>(y, x);
 							values.push_back(std::max(pix[0], std::max(pix[1], pix[2])));
 						}
-					}
 					if (!values.empty())
 					{
 						sort(values.begin(), values.end());
-						const int n = static_cast<int>(values.size());
-						const int lowIdx = n / 10;
+						const int n       = static_cast<int>(values.size());
+						const int lowIdx  = n / 10;
 						const int highIdx = n - n / 10 - 1;
 						int thres = (values[lowIdx] + values[highIdx]) / 2 + kThresholdBias;
 						thres = std::max(0, std::min(255, thres));
@@ -159,180 +91,245 @@ namespace ImgParse
 			binImg.create(H, W, CV_8UC3);
 			for (int y = 0; y < H; ++y)
 			{
-				const int by = y / kThresholdBlockSize;
+				const int by = y / kThresholdBlock;
 				for (int x = 0; x < W; ++x)
 				{
-					const int bx = x / kThresholdBlockSize;
-					const int thres = thresholds[by][bx];
-					const Vec3b pix = imgColor.at<Vec3b>(y, x);
-					const int mx = std::max(pix[0], std::max(pix[1], pix[2]));
-					binImg.at<Vec3b>(y, x) = (mx > thres) ? Vec3b(255, 255, 255) : Vec3b(0, 0, 0);
+					const int bx  = x / kThresholdBlock;
+					const Vec3b p = imgColor.at<Vec3b>(y, x);
+					const int   mx = std::max(p[0], std::max(p[1], p[2]));
+					binImg.at<Vec3b>(y, x) = (mx > thresholds[by][bx])
+					                         ? Vec3b(255, 255, 255) : Vec3b(0, 0, 0);
 				}
 			}
 		}
 
-		// Sort 4 markers into [TL, TR, BR, BL] using the anti-perspective-flip + rotation
-		// logic from modify/warp_engine.cpp.
-		// Requires at least 4 markers. If more than 4 are present the 4 farthest from the
-		// approximate center are kept (same selection as warp_engine).
-		// BR is identified by the minimum area/(dist²) ratio — the small BR finder has a
-		// disproportionately small area relative to its distance from the center compared to
-		// the three large corner finders.  The remaining three are then assigned by sorting
-		// all four by polar angle around the exact centroid.
-		bool sortFourMarkers(const vector<Marker>& markers, array<Point2f, 4>& ordered)
+		// Locate the four perspective corners TL/TR/BR/BL using the processV15 approach
+		// from modify/pic.cpp (3-ring nested contour detection + geometry validation).
+		// useHSV: also suppress saturated-colour regions (same as modify/pic.cpp).
+		bool locateCorners(const Mat& srcImg, bool useHSV,
+		                   Point2f& tl, Point2f& tr, Point2f& br, Point2f& bl)
 		{
-			if (markers.size() < 4)
+			Mat gray;
+			if (srcImg.channels() == 3)
+				cvtColor(srcImg, gray, COLOR_BGR2GRAY);
+			else
+				gray = srcImg.clone();
+
+			if (useHSV && srcImg.channels() == 3)
 			{
-				return false;
+				Mat hsv;
+				cvtColor(srcImg, hsv, COLOR_BGR2HSV);
+				vector<Mat> hsvCh;
+				split(hsv, hsvCh);
+				Mat satMask;
+				threshold(hsvCh[1], satMask, 180, 255, THRESH_BINARY);
+				gray.setTo(255, satMask);
 			}
 
-			vector<Marker> pts(markers);
+			const int maxDim = std::max(srcImg.cols, srcImg.rows);
 
-			// Approximate center over all detected candidates.
-			Point2f approxCenter(0.0f, 0.0f);
-			for (const auto& p : pts)
-			{
-				approxCenter += p.center;
-			}
-			approxCenter.x /= static_cast<float>(pts.size());
-			approxCenter.y /= static_cast<float>(pts.size());
+			int blurSz = std::max(5, static_cast<int>(maxDim * 7.0 / 1920.0));
+			if (blurSz % 2 == 0) ++blurSz;
+			Mat blurred;
+			GaussianBlur(gray, blurred, Size(blurSz, blurSz), 0);
 
-			// If more than 4, keep the 4 farthest from the approximate center — they are
-			// the outermost structural markers.
-			if (pts.size() > 4)
+			int blockSz = std::max(31, static_cast<int>(maxDim * 31.0 / 1920.0));
+			if (blockSz % 2 == 0) ++blockSz;
+			Mat binary;
+			adaptiveThreshold(blurred, binary, 255,
+			                  ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY_INV, blockSz, 10);
+
+			Mat kernel = getStructuringElement(MORPH_CROSS, Size(2, 2));
+			Mat closedBinary;
+			morphologyEx(binary, closedBinary, MORPH_CLOSE, kernel);
+
+			vector<vector<Point>> contours;
+			vector<Vec4i>         hierarchy;
+			findContours(closedBinary, contours, hierarchy, RETR_TREE, CHAIN_APPROX_SIMPLE);
+
+			const double minArea    = std::max(15.0, static_cast<double>(maxDim) * maxDim * 0.000004);
+			const double mergeDist  = std::max(15.0, static_cast<double>(maxDim) * 0.0078);
+
+			vector<Marker> markers;
+			for (size_t i = 0; i < contours.size(); ++i)
 			{
-				sort(pts.begin(), pts.end(), [&approxCenter](const Marker& a, const Marker& b)
+				const int c1 = findLargestChild(static_cast<int>(i), contours, hierarchy);
+				if (c1 < 0) continue;
+				const int c2 = findLargestChild(c1, contours, hierarchy);
+				if (c2 < 0) continue;
+				const double a0 = contourArea(contours[i]);
+				const double a1 = contourArea(contours[c1]);
+				const double a2 = contourArea(contours[c2]);
+				if (a0 < minArea) continue;
+				const double r01 = a0 / std::max(a1, 1.0);
+				const double r12 = a1 / std::max(a2, 1.0);
+				if (r01 > 1.2 && r01 < 8.0 && r12 > 1.2 && r12 < 8.0)
 				{
-					return norm(a.center - approxCenter) > norm(b.center - approxCenter);
-				});
-				pts.resize(4);
-			}
-
-			// Exact centroid of the 4 selected markers.
-			Point2f exactCenter(0.0f, 0.0f);
-			for (const auto& p : pts)
-			{
-				exactCenter += p.center;
-			}
-			exactCenter.x /= 4.0f;
-			exactCenter.y /= 4.0f;
-
-			// BR finder: smallest area/(dist²) ratio — it is physically smaller than the
-			// three large finders, so its area is low relative to its corner distance.
-			int brIdx = -1;
-			float minRatio = 1e9f;
-			for (int i = 0; i < 4; ++i)
-			{
-				const float dist = static_cast<float>(norm(pts[i].center - exactCenter));
-				if (dist < 1.0f)
-				{
-					continue;
-				}
-				const float ratio = pts[i].area / (dist * dist);
-				if (ratio < minRatio)
-				{
-					minRatio = ratio;
-					brIdx = i;
-				}
-			}
-			if (brIdx < 0)
-			{
-				return false;
-			}
-
-			// Sort all 4 by polar angle around exactCenter (counter-clockwise from -π).
-			vector<Point2f> sortedPts;
-			sortedPts.reserve(4);
-			for (const auto& p : pts)
-			{
-				sortedPts.push_back(p.center);
-			}
-			sort(sortedPts.begin(), sortedPts.end(), [&exactCenter](const Point2f& a, const Point2f& b)
-			{
-				return atan2(a.y - exactCenter.y, a.x - exactCenter.x)
-				     < atan2(b.y - exactCenter.y, b.x - exactCenter.x);
-			});
-
-			// Locate BR in the angle-sorted list.
-			const Point2f brPoint = pts[brIdx].center;
-			int sortedBrIdx = 0;
-			for (int i = 0; i < 4; ++i)
-			{
-				if (norm(sortedPts[i] - brPoint) < 1.0f)
-				{
-					sortedBrIdx = i;
-					break;
+					const Moments mu = moments(contours[i]);
+					if (mu.m00 != 0)
+						markers.push_back({ Point2f(static_cast<float>(mu.m10 / mu.m00),
+						                            static_cast<float>(mu.m01 / mu.m00)), a0 });
 				}
 			}
 
-			// Angular order starting from BR: BR → BL → TL → TR (CCW).
-			ordered[2] = sortedPts[sortedBrIdx];                  // BR
-			ordered[3] = sortedPts[(sortedBrIdx + 1) % 4];        // BL
-			ordered[0] = sortedPts[(sortedBrIdx + 2) % 4];        // TL
-			ordered[1] = sortedPts[(sortedBrIdx + 3) % 4];        // TR
+			// Merge duplicates — keep the largest-area representative.
+			vector<Marker> unique;
+			for (const auto& m : markers)
+			{
+				bool dup = false;
+				for (auto& u : unique)
+				{
+					if (norm(m.center - u.center) < mergeDist)
+					{
+						if (m.area > u.area) u = m;
+						dup = true;
+						break;
+					}
+				}
+				if (!dup) unique.push_back(m);
+			}
+			markers = unique;
+
+			if (markers.size() < 3) return false;
+
+			// Sort by area descending; the three largest are the structural finders.
+			std::sort(markers.begin(), markers.end(),
+			          [](const Marker& a, const Marker& b) { return a.area > b.area; });
+
+			// The marker farthest from its two neighbours (i.e. at the right-angle corner) is TL.
+			double maxDist   = 0.0;
+			int    rightAngleIdx = -1;
+			for (int i = 0; i < 3; ++i)
+				for (int j = i + 1; j < 3; ++j)
+				{
+					const double d = norm(markers[i].center - markers[j].center);
+					if (d > maxDist) { maxDist = d; rightAngleIdx = 3 - i - j; }
+				}
+
+			const Point2f tlCand = markers[rightAngleIdx].center;
+			const Point2f pt1    = markers[(rightAngleIdx + 1) % 3].center;
+			const Point2f pt2    = markers[(rightAngleIdx + 2) % 3].center;
+
+			const Point2f v1   = pt1 - tlCand;
+			const Point2f v2   = pt2 - tlCand;
+			const double  len1 = norm(v1);
+			const double  len2 = norm(v2);
+
+			// Validate near-right-angle geometry.
+			const double legRatio = len1 / std::max(len2, 1.0);
+			if (legRatio < 0.4 || legRatio > 2.5) return false;
+			const double cosTheta = (v1.x * v2.x + v1.y * v2.y) / std::max(len1 * len2, 1.0);
+			if (std::abs(cosTheta) > 0.75) return false;
+
+			// Cross product determines which leg is TR and which is BL.
+			const double cross = v1.x * v2.y - v1.y * v2.x;
+			Point2f trCand, blCand;
+			if (cross > 0) { trCand = pt1; blCand = pt2; }
+			else           { trCand = pt2; blCand = pt1; }
+
+			// BR: use the detected 4th marker if close to the parallelogram prediction,
+			// otherwise estimate it.
+			Point2f brCand     = trCand + blCand - tlCand;
+			const double maxLeg = std::max(len1, len2);
+			if (markers.size() > 3)
+			{
+				double minD    = 1e9;
+				int    bestIdx = -1;
+				for (size_t i = 3; i < markers.size(); ++i)
+				{
+					const double d = norm(markers[i].center - brCand);
+					if (d < minD) { minD = d; bestIdx = static_cast<int>(i); }
+				}
+				if (bestIdx >= 0 && minD < maxLeg * 0.4)
+					brCand = markers[bestIdx].center;
+			}
+
+			tl = tlCand;
+			tr = trCand;
+			br = brCand;
+			bl = blCand;
 			return true;
 		}
 	}
 
 	bool Main(const Mat& srcImg, Mat& disImg)
 	{
-		if (srcImg.empty())
+		if (srcImg.empty()) return false;
+
+		// Reset cached transform when input resolution changes (from modify/pic.cpp).
+		if (srcImg.cols != g_lastCols || srcImg.rows != g_lastRows)
 		{
+			g_lastCols   = srcImg.cols;
+			g_lastRows   = srcImg.rows;
+			g_frameCount = 0;
+			g_lastValidTransform = Mat();
+		}
+
+		// Square-input fast path: direct Otsu resize (from modify/pic.cpp).
+		const double aspect = static_cast<double>(srcImg.cols) / srcImg.rows;
+		if (aspect > 0.95 && aspect < 1.05 && srcImg.cols > 200)
+		{
+			Mat imgGray;
+			if (srcImg.channels() == 3) cvtColor(srcImg, imgGray, COLOR_BGR2GRAY);
+			else                        imgGray = srcImg.clone();
+			Mat binRaw;
+			threshold(imgGray, binRaw, 0, 255, THRESH_BINARY | THRESH_OTSU);
+			disImg.create(kFrameSize, kFrameSize, CV_8UC3);
+			const float stepX = static_cast<float>(srcImg.cols) / kFrameSize;
+			const float stepY = static_cast<float>(srcImg.rows) / kFrameSize;
+			for (int r = 0; r < kFrameSize; ++r)
+				for (int c = 0; c < kFrameSize; ++c)
+				{
+					const int px = std::min(static_cast<int>((c + 0.5f) * stepX), srcImg.cols - 1);
+					const int py = std::min(static_cast<int>((r + 0.5f) * stepY), srcImg.rows - 1);
+					const uint8_t val = binRaw.at<uint8_t>(py, px);
+					disImg.at<Vec3b>(r, c) = val ? Vec3b(255, 255, 255) : Vec3b(0, 0, 0);
+				}
+			return true;
+		}
+
+		// Warmup: skip the first few frames until detection is stable (from modify/pic.cpp).
+		if (g_frameCount < 3)
+		{
+			++g_frameCount;
 			return false;
 		}
 
-		// Always scale to exactly kMaxDetectionDimension (800px) for detection — matching
-		// modify/warp_engine.cpp. This ensures fixed params (block=101, minArea=500, etc.)
-		// work correctly for all input sizes, including sub-800px inputs that need upscaling.
-		const float scale = kMaxDetectionDimension / static_cast<float>(std::max(srcImg.cols, srcImg.rows));
-		Mat smallImg;
-		resize(srcImg, smallImg, Size(), scale, scale, scale > 1.0f ? INTER_LINEAR : INTER_AREA);
-
-		vector<Marker> smallMarkers = findMarkerCenters(smallImg);
-		vector<Marker> markers;
-		markers.reserve(smallMarkers.size());
-		for (const auto& pt : smallMarkers)
+		auto warpAndThreshold = [&](const Mat& M) -> bool
 		{
-			markers.push_back({ Point2f(pt.center.x / scale, pt.center.y / scale), pt.area });
-		}
-
-		auto useCached = [&]() -> bool
-		{
-			if (g_lastValidTransform.empty())
-			{
-				return false;
-			}
 			Mat warped;
-			warpPerspective(srcImg, warped, g_lastValidTransform, Size(kFrameSize, kFrameSize), INTER_NEAREST);
+			warpPerspective(srcImg, warped, M, Size(kFrameSize, kFrameSize), INTER_NEAREST);
 			blockwiseColorMaxAdaptiveThreshold(warped, disImg);
 			return true;
 		};
 
-		if (markers.size() < 4)
+		auto useCached = [&]() -> bool
 		{
-			return useCached();
+			if (g_lastValidTransform.empty()) return false;
+			return warpAndThreshold(g_lastValidTransform);
+		};
+
+		// Try detection without HSV assist, then with (from modify/pic.cpp).
+		const int passes = (srcImg.channels() == 3) ? 2 : 1;
+		for (int pass = 0; pass < passes; ++pass)
+		{
+			Point2f tl, tr, br, bl;
+			if (!locateCorners(srcImg, pass == 1, tl, tr, br, bl))
+				continue;
+
+			// Build perspective transform using the r_min/r_max formula.
+			const vector<Point2f> srcPts = { tl, tr, br, bl };
+			const vector<Point2f> dstPts = {
+				Point2f(kRMin * kFrameSize, kRMin * kFrameSize),
+				Point2f(kRMax * kFrameSize, kRMin * kFrameSize),
+				Point2f(kRMax * kFrameSize, kRMax * kFrameSize),
+				Point2f(kRMin * kFrameSize, kRMax * kFrameSize)
+			};
+			const Mat M = getPerspectiveTransform(srcPts, dstPts);
+			g_lastValidTransform = M.clone();
+			return warpAndThreshold(M);
 		}
 
-		array<Point2f, 4> srcPoints{};
-		if (!sortFourMarkers(markers, srcPoints))
-		{
-			return useCached();
-		}
-
-		const array<Point2f, 4> dstPoints =
-		{ {
-			Point2f(kRMin * kFrameSize, kRMin * kFrameSize),
-			Point2f(kRMax * kFrameSize, kRMin * kFrameSize),
-			Point2f(kRMax * kFrameSize, kRMax * kFrameSize),
-			Point2f(kRMin * kFrameSize, kRMax * kFrameSize)
-		} };
-
-		const Mat transform = getPerspectiveTransform(srcPoints.data(), dstPoints.data());
-		g_lastValidTransform = transform.clone();
-
-		Mat warped;
-		warpPerspective(srcImg, warped, transform, Size(kFrameSize, kFrameSize), INTER_NEAREST);
-		blockwiseColorMaxAdaptiveThreshold(warped, disImg);
-		return true;
+		return useCached();
 	}
 } // namespace ImgParse
