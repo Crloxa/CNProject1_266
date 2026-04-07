@@ -13,9 +13,14 @@ namespace ImgParse
 	namespace
 	{
 		constexpr int kFrameSize = 266;
-		constexpr float kFinderCenter = 21.0f;                 // center of each large 42x42 finder marker (index 12-15 ring: col/row 6..36, centroid=21)
-		constexpr float kOppositeFinderCenter = 245.0f;        // 266 - 21: center of TR/BL large markers
-		constexpr float kBRFinderCenter = 253.5f;              // BR marker center in output frame
+		constexpr int kGridSize = 266;                         // logical data grid size in output pixels
+		constexpr int kQuietZone = 0;                          // quiet zone width in output pixels
+		constexpr int kLargeFinder = 42;                       // large finder marker size in output pixels
+		// r_min = (quiet_zone + large_finder/2) / (grid_size + 2*quiet_zone) = 21/266
+		// r_max = 1 - r_min = 245/266
+		// dst corners are symmetric: TL=(r_min,r_min), TR=(r_max,r_min), BR=(r_max,r_max), BL=(r_min,r_max)
+		constexpr float kRMin = (kQuietZone + kLargeFinder / 2.0f) / (kGridSize + 2.0f * kQuietZone);
+		constexpr float kRMax = 1.0f - kRMin;
 		constexpr float kMaxDetectionDimension = 800.0f;       // always resize to this before detection (same as modify/warp_engine)
 		constexpr int kDetectAdaptiveBlock = 101;              // tuned for 800px images (matches modify/warp_engine.cpp)
 		constexpr double kDetectMinArea = 500.0;               // tuned for 800px images (matches modify/warp_engine.cpp)
@@ -298,7 +303,7 @@ namespace ImgParse
 				return false;
 			}
 			Mat warped;
-			warpPerspective(srcImg, warped, g_lastValidTransform, Size(kFrameSize, kFrameSize), INTER_LINEAR);
+			warpPerspective(srcImg, warped, g_lastValidTransform, Size(kFrameSize, kFrameSize), INTER_NEAREST);
 			blockwiseColorMaxAdaptiveThreshold(warped, disImg);
 			return true;
 		};
@@ -316,17 +321,17 @@ namespace ImgParse
 
 		const array<Point2f, 4> dstPoints =
 		{ {
-			Point2f(kFinderCenter,         kFinderCenter),
-			Point2f(kOppositeFinderCenter, kFinderCenter),
-			Point2f(kBRFinderCenter,       kBRFinderCenter),
-			Point2f(kFinderCenter,         kOppositeFinderCenter)
+			Point2f(kRMin * kFrameSize, kRMin * kFrameSize),
+			Point2f(kRMax * kFrameSize, kRMin * kFrameSize),
+			Point2f(kRMax * kFrameSize, kRMax * kFrameSize),
+			Point2f(kRMin * kFrameSize, kRMax * kFrameSize)
 		} };
 
 		const Mat transform = getPerspectiveTransform(srcPoints.data(), dstPoints.data());
 		g_lastValidTransform = transform.clone();
 
 		Mat warped;
-		warpPerspective(srcImg, warped, transform, Size(kFrameSize, kFrameSize), INTER_LINEAR);
+		warpPerspective(srcImg, warped, transform, Size(kFrameSize, kFrameSize), INTER_NEAREST);
 		blockwiseColorMaxAdaptiveThreshold(warped, disImg);
 		return true;
 	}
