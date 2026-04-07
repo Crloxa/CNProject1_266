@@ -240,17 +240,18 @@ namespace ImgParse
 				if (srcImg.channels() == 3) cvtColor(srcImg, grayFull, COLOR_BGR2GRAY);
 				else                        grayFull = srcImg.clone();
 
-				// Step 2: suppress moire / sensor noise with a small Gaussian blur.
-				//         Moire cycles between camera pixels and screen pixels are
-				//         typically ≤ 7 px at 1920p, while each data cell maps to
-				//         ~7 px.  A 5-px blur (scaled) averages out the moire within
-				//         each cell without blurring across cell boundaries.
-				//         This mirrors the blur step in locateCorners().
+				// Step 2: suppress moire with a median blur.
+				//         Median blur removes periodic interference (moire) without
+				//         blurring the gradients that Gaussian blur would introduce.
+				//         Unlike Gaussian, median produces no gray halos, so the
+				//         subsequent large-window adaptive threshold cannot form ring
+				//         artifacts.  A 3-pixel kernel (scaled to image size, always odd)
+				//         eliminates moire cycles while preserving cell boundaries.
 				const int maxDim = std::max(srcImg.cols, srcImg.rows);
-				int blurSz = std::max(5, static_cast<int>(maxDim * 5.0 / 1920.0));
-				if (blurSz % 2 == 0) ++blurSz;
+				int medSz = std::max(3, static_cast<int>(maxDim * 3.0 / 1920.0));
+				if (medSz % 2 == 0) ++medSz;
 				Mat blurredFull;
-				GaussianBlur(grayFull, blurredFull, Size(blurSz, blurSz), 0);
+				medianBlur(grayFull, blurredFull, medSz);
 
 				// Step 3: binarize at full resolution with adaptive threshold (local contrast).
 				//         Doing this BEFORE the warp (like warp_engine.cpp) avoids the
