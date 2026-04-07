@@ -2,7 +2,6 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
-#include <limits>
 
 namespace ImgParse {
 
@@ -38,56 +37,35 @@ namespace ImgParse {
     }
 
     //中文
-    //分块RGB最大值自适应阈值二值化
+    //warp_engine颜色校正：HSV饱和度掩膜 + 自适应阈值二值化（参照modify/warp_engine.cpp）
     //
-    void blockwiseColorMaxAdaptiveThreshold(const Mat& imgColor, Mat& binImg, int block_size = 19, int bias = 10) {
-        int H = imgColor.rows, W = imgColor.cols;
-        int nBlockY = (H + block_size - 1) / block_size;
-        int nBlockX = (W + block_size - 1) / block_size;
-        std::vector<std::vector<int>> thresholds(nBlockY, std::vector<int>(nBlockX, 128));
-        for (int by = 0; by < nBlockY; ++by) {
-            for (int bx = 0; bx < nBlockX; ++bx) {
-                std::vector<int> vRGB;
-                int y0 = by * block_size, y1 = std::min(y0 + block_size, H);
-                int x0 = bx * block_size, x1 = std::min(x0 + block_size, W);
-                for (int y = y0; y < y1; ++y)
-                    for (int x = x0; x < x1; ++x) {
-                        Vec3b pix = imgColor.at<Vec3b>(y, x);
-                        int mx = std::max(pix[0], std::max(pix[1], pix[2]));
-                        vRGB.push_back(mx);
-                    }
-                if (!vRGB.empty()) {
-                    std::sort(vRGB.begin(), vRGB.end());
-                    int n = (int)vRGB.size();
-                    int lowIdx = n / 10, highIdx = n - n / 10 - 1;
-                    int blackMax = vRGB[lowIdx];
-                    int whiteMin = vRGB[highIdx];
-                    int thres = (blackMax + whiteMin) / 2 + bias;
-                    if (thres < 0) thres = 0;
-                    if (thres > 255) thres = 255;
-                    thresholds[by][bx] = thres;
-                }
-                else {
-                    thresholds[by][bx] = 128;
-                }
-            }
-        }
-        binImg.create(H, W, CV_8UC3);
-        for (int y = 0; y < H; ++y) {
-            int by = y / block_size;
-            for (int x = 0; x < W; ++x) {
-                int bx = x / block_size;
-                int thres = thresholds[by][bx];
-                Vec3b pix = imgColor.at<Vec3b>(y, x);
-                int mx = std::max(pix[0], std::max(pix[1], pix[2]));
-                if (mx > thres) {
-                    binImg.at<Vec3b>(y, x) = Vec3b(255, 255, 255);
-                }
-                else {
-                    binImg.at<Vec3b>(y, x) = Vec3b(0, 0, 0);
-                }
-            }
-        }
+    void warpEngineColorCorrect(const Mat& imgWarped, Mat& disImg) {
+        //中文
+        //转灰度，并用HSV饱和度掩膜把彩色区域置白（与warp_engine.cpp保持一致）
+        //
+        Mat grayWarped;
+        cvtColor(imgWarped, grayWarped, COLOR_BGR2GRAY);
+        Mat hsvWarped;
+        cvtColor(imgWarped, hsvWarped, COLOR_BGR2HSV);
+        vector<Mat> hsvCh;
+        split(hsvWarped, hsvCh);
+        Mat satMask;
+        threshold(hsvCh[1], satMask, 180, 255, THRESH_BINARY);
+        grayWarped.setTo(255, satMask);
+
+        //中文
+        //高斯模糊去噪（参数与warp_engine.cpp缩放逻辑一致，对266px图像取5）
+        //
+        Mat blurred;
+        GaussianBlur(grayWarped, blurred, Size(5, 5), 0);
+
+        //中文
+        //高斯加权自适应阈值，block=31对应266px下warp_engine的缩放比例
+        //
+        Mat binary;
+        adaptiveThreshold(blurred, binary, 255, ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY, 31, 10);
+
+        cvtColor(binary, disImg, COLOR_GRAY2BGR);
     }
 
     //中文
@@ -231,7 +209,7 @@ namespace ImgParse {
         vector<Point2f> dstPoints266 = {
             Point2f(21.0f, 21.0f),
             Point2f(245.0f, 21.0f),
-            Point2f(253.5f, 253.5f),
+            Point2f(245.0f, 245.0f),
             Point2f(21.0f, 245.0f)
         };
         Mat transformMatrix266 = getPerspectiveTransform(srcPoints, dstPoints266);
@@ -242,13 +220,10 @@ namespace ImgParse {
         Mat imgWarped;
         warpPerspective(srcImg, imgWarped, transformMatrix266, Size(266, 266), INTER_LINEAR);
 
-        Mat binWarped;
         //中文
-        //使用分块RGB最大值自适应阈值进行二值化
+        //使用warp_engine颜色校正进行二值化
         //
-        blockwiseColorMaxAdaptiveThreshold(imgWarped, binWarped, 19, 10);
-
-        disImg = binWarped.clone();
+        warpEngineColorCorrect(imgWarped, disImg);
         return true;
     }
 
@@ -304,12 +279,10 @@ namespace ImgParse {
         if (!lastValidTransform.empty()) {
             Mat imgWarped;
             //中文
-            //兜底：对原彩色图做仿射，分块阈值处理
+            //兜底：对原彩色图做仿射，warp_engine颜色校正处理
             //
             warpPerspective(srcImg, imgWarped, lastValidTransform, Size(266, 266), INTER_LINEAR);
-            Mat binWarped;
-            blockwiseColorMaxAdaptiveThreshold(imgWarped, binWarped, 19, 10);
-            disImg = binWarped.clone();
+            warpEngineColorCorrect(imgWarped, disImg);
             return true;
         }
         return false;
