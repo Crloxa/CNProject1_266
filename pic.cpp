@@ -12,15 +12,6 @@ namespace ImgParse
 	namespace
 	{
 		constexpr int   kFrameSize = 266;
-		constexpr int   kGridSize = 266;
-		constexpr int   kQuietZone = 0;
-		constexpr int   kLargeFinder = 42;
-		// r_min = (quiet_zone + large_finder/2) / (grid_size + 2*quiet_zone) = 21/266
-		// r_max = (logic_total_width - center_offset) / logic_total_width    = 245/266
-		constexpr float kRMin = (kQuietZone + kLargeFinder / 2.0f) / (kGridSize + 2.0f * kQuietZone);
-		constexpr float kRMax = 1.0f - kRMin;
-		constexpr int   kThresholdBlock = 19;
-		constexpr int   kThresholdBias = 10;
 
 		struct Marker
 		{
@@ -48,59 +39,6 @@ namespace ImgParse
 				child = hierarchy[child][0];
 			}
 			return maxIdx;
-		}
-
-		// Block-wise RGB-max adaptive threshold binarisation (from modify/pic.cpp).
-		void blockwiseColorMaxAdaptiveThreshold(const Mat& imgColor, Mat& binImg)
-		{
-			const int H = imgColor.rows;
-			const int W = imgColor.cols;
-			const int nBlockY = (H + kThresholdBlock - 1) / kThresholdBlock;
-			const int nBlockX = (W + kThresholdBlock - 1) / kThresholdBlock;
-			vector<vector<int>> thresholds(nBlockY, vector<int>(nBlockX, 128));
-
-			for (int by = 0; by < nBlockY; ++by)
-			{
-				for (int bx = 0; bx < nBlockX; ++bx)
-				{
-					const int y0 = by * kThresholdBlock;
-					const int y1 = std::min(y0 + kThresholdBlock, H);
-					const int x0 = bx * kThresholdBlock;
-					const int x1 = std::min(x0 + kThresholdBlock, W);
-					vector<int> values;
-					values.reserve((y1 - y0) * (x1 - x0));
-					for (int y = y0; y < y1; ++y)
-						for (int x = x0; x < x1; ++x)
-						{
-							const Vec3b pix = imgColor.at<Vec3b>(y, x);
-							values.push_back(std::max(pix[0], std::max(pix[1], pix[2])));
-						}
-					if (!values.empty())
-					{
-						sort(values.begin(), values.end());
-						const int n = static_cast<int>(values.size());
-						const int lowIdx = n / 10;
-						const int highIdx = n - n / 10 - 1;
-						int thres = (values[lowIdx] + values[highIdx]) / 2 + kThresholdBias;
-						thres = std::max(0, std::min(255, thres));
-						thresholds[by][bx] = thres;
-					}
-				}
-			}
-
-			binImg.create(H, W, CV_8UC3);
-			for (int y = 0; y < H; ++y)
-			{
-				const int by = y / kThresholdBlock;
-				for (int x = 0; x < W; ++x)
-				{
-					const int bx = x / kThresholdBlock;
-					const Vec3b p = imgColor.at<Vec3b>(y, x);
-					const int   mx = std::max(p[0], std::max(p[1], p[2]));
-					binImg.at<Vec3b>(y, x) = (mx > thresholds[by][bx])
-						? Vec3b(255, 255, 255) : Vec3b(0, 0, 0);
-				}
-			}
 		}
 
 		// Locate the four perspective corners TL/TR/BR/BL using the processV15 approach
@@ -295,18 +233,30 @@ namespace ImgParse
 			return false;
 		}
 
-		auto warpAndThreshold = [&](const Mat& M) -> bool
+		auto warpColor = [&](const Mat& M) -> bool
 			{
 				Mat warped;
-				warpPerspective(srcImg, warped, M, Size(kFrameSize, kFrameSize), INTER_NEAREST);
-				blockwiseColorMaxAdaptiveThreshold(warped, disImg);
+				warpPerspective(srcImg, warped, M, Size(kFrameSize, kFrameSize), INTER_LINEAR);
+				// Otsu binarize: same method as the square fast-path, produces clean black/white
+				// output for ImageDecode and eliminates moiré from the ~7x downscale.
+				Mat warpedGray;
+				cvtColor(warped, warpedGray, COLOR_BGR2GRAY);
+				Mat binRaw;
+				threshold(warpedGray, binRaw, 0, 255, THRESH_BINARY | THRESH_OTSU);
+				disImg.create(kFrameSize, kFrameSize, CV_8UC3);
+				for (int r = 0; r < kFrameSize; ++r)
+					for (int c = 0; c < kFrameSize; ++c)
+					{
+						const uint8_t val = binRaw.at<uint8_t>(r, c);
+						disImg.at<Vec3b>(r, c) = val ? Vec3b(255, 255, 255) : Vec3b(0, 0, 0);
+					}
 				return true;
 			};
 
 		auto useCached = [&]() -> bool
 			{
 				if (g_lastValidTransform.empty()) return false;
-				return warpAndThreshold(g_lastValidTransform);
+				return warpColor(g_lastValidTransform);
 			};
 
 		// Try detection without HSV assist, then with (from modify/pic.cpp).
@@ -317,17 +267,17 @@ namespace ImgParse
 			if (!locateCorners(srcImg, pass == 1, tl, tr, br, bl))
 				continue;
 
-			// Build perspective transform using the r_min/r_max formula.
+			// Build perspective transform using the corrected dst points (per warp_engine.cpp convention).
 			const vector<Point2f> srcPts = { tl, tr, br, bl };
 			const vector<Point2f> dstPts = {
-				Point2f(kRMin * kFrameSize, kRMin * kFrameSize),
-				Point2f(kRMax * kFrameSize, kRMin * kFrameSize),
-				Point2f(kRMax * kFrameSize, kRMax * kFrameSize),
-				Point2f(kRMin * kFrameSize, kRMax * kFrameSize)
+				Point2f(21.0f, 21.0f),
+				Point2f(245.0f, 21.0f),
+				Point2f(253.5f, 253.5f),
+				Point2f(21.0f, 245.0f)
 			};
 			const Mat M = getPerspectiveTransform(srcPts, dstPts);
 			g_lastValidTransform = M.clone();
-			return warpAndThreshold(M);
+			return warpColor(M);
 		}
 
 		return useCached();
