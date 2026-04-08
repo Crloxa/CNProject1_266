@@ -92,7 +92,7 @@ namespace ImgParse
 		struct Marker
 		{
 			Point2f center;
-			double  area;
+			float   area;
 		};
 
 		// Cached corners from the most recent successful detection.
@@ -102,59 +102,37 @@ namespace ImgParse
 		int g_lastRows = 0;
 		int g_frameCount = 0;
 
-		// Find the child contour of parentIdx with the largest area (from modify/pic.cpp).
-		int findLargestChild(int parentIdx,
-			const vector<vector<Point>>& contours,
-			const vector<Vec4i>& hierarchy)
-		{
-			int    maxIdx = -1;
-			double maxArea = -1.0;
-			int    child = hierarchy[parentIdx][2];
-			while (child >= 0)
-			{
-				const double a = contourArea(contours[child]);
-				if (a > maxArea) { maxArea = a; maxIdx = child; }
-				child = hierarchy[child][0];
-			}
-			return maxIdx;
-		}
-
-		// Locate the four perspective corners TL/TR/BR/BL using the processV15 approach
-		// from modify/pic.cpp (3-ring nested contour detection + geometry validation).
-		// useHSV: also suppress saturated-colour regions (same as modify/pic.cpp).
-		bool locateCorners(const Mat& srcImg, bool useHSV,
-			Point2f& tl, Point2f& tr, Point2f& br, Point2f& bl)
+		// ── Localization: ported from modify/warp_engine.cpp (FindMarkerCenters) ──
+		// Runs on the pre-scaled image (≤800 px max dim).
+		// Detects finder-pattern markers via 2-level nested contours, HSV saturation
+		// suppression, adaptive Gaussian threshold, and morphological close — exactly
+		// as implemented in the original working engine. Parameters are intentionally
+		// unchanged from warp_engine.cpp.
+		vector<Marker> findMarkers(const Mat& img)
 		{
 			Mat gray;
-			if (srcImg.channels() == 3)
-				cvtColor(srcImg, gray, COLOR_BGR2GRAY);
-			else
-				gray = srcImg.clone();
-
-			if (useHSV && srcImg.channels() == 3)
+			if (img.channels() == 3)
 			{
-				Mat hsv;
-				cvtColor(srcImg, hsv, COLOR_BGR2HSV);
+				Mat hsv, satMask;
+				cvtColor(img, hsv, COLOR_BGR2HSV);
+				cvtColor(img, gray, COLOR_BGR2GRAY);
 				vector<Mat> hsvCh;
 				split(hsv, hsvCh);
-				Mat satMask;
 				threshold(hsvCh[1], satMask, 180, 255, THRESH_BINARY);
 				gray.setTo(255, satMask);
 			}
+			else
+			{
+				gray = img.clone();
+			}
 
-			const int maxDim = std::max(srcImg.cols, srcImg.rows);
-
-			int blurSz = std::max(5, static_cast<int>(maxDim * 7.0 / 1920.0));
-			if (blurSz % 2 == 0) ++blurSz;
-			Mat blurred;
-			GaussianBlur(gray, blurred, Size(blurSz, blurSz), 0);
-
-			int blockSz = std::max(31, static_cast<int>(maxDim * 31.0 / 1920.0));
-			if (blockSz % 2 == 0) ++blockSz;
+			// Parameters unchanged from warp_engine.cpp: blockSize=101, C=15.
 			Mat binary;
-			adaptiveThreshold(blurred, binary, 255,
-				ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY_INV, blockSz, 10);
+			adaptiveThreshold(gray, binary, 255,
+				ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY_INV, 101, 15);
 
+			// Morphological close with L-shaped kernel (do not change — see
+			// warp_engine.cpp comment: "各位活爹，上面改的代码和参数调了两节课").
 			Mat kernel = getStructuringElement(MORPH_CROSS, Size(2, 2));
 			Mat closedBinary;
 			morphologyEx(binary, closedBinary, MORPH_CLOSE, kernel);
@@ -163,107 +141,125 @@ namespace ImgParse
 			vector<Vec4i>         hierarchy;
 			findContours(closedBinary, contours, hierarchy, RETR_TREE, CHAIN_APPROX_SIMPLE);
 
-			const double minArea = std::max(15.0, static_cast<double>(maxDim) * maxDim * 0.000004);
-			const double mergeDist = std::max(15.0, static_cast<double>(maxDim) * 0.0078);
-
-			vector<Marker> markers;
+			vector<Marker> centers;
 			for (size_t i = 0; i < contours.size(); ++i)
 			{
-				const int c1 = findLargestChild(static_cast<int>(i), contours, hierarchy);
-				if (c1 < 0) continue;
-				const int c2 = findLargestChild(c1, contours, hierarchy);
-				if (c2 < 0) continue;
-				const double a0 = contourArea(contours[i]);
-				const double a1 = contourArea(contours[c1]);
-				const double a2 = contourArea(contours[c2]);
-				if (a0 < minArea) continue;
-				const double r01 = a0 / std::max(a1, 1.0);
-				const double r12 = a1 / std::max(a2, 1.0);
-				if (r01 > 1.2 && r01 < 8.0 && r12 > 1.2 && r12 < 8.0)
+				// Count nesting depth; ≥2 levels = finder pattern.
+				int kidIdx = hierarchy[static_cast<int>(i)][2];
+				int cnt    = 0;
+				while (kidIdx != -1)
 				{
-					const Moments mu = moments(contours[i]);
-					if (mu.m00 != 0)
-						markers.push_back({ Point2f(static_cast<float>(mu.m10 / mu.m00),
-													static_cast<float>(mu.m01 / mu.m00)), a0 });
+					++cnt;
+					kidIdx = hierarchy[kidIdx][2];
+					if (cnt >= 2) break;
 				}
+				if (cnt < 2) continue;
+
+				const Moments mu = moments(contours[i]);
+				if (mu.m00 >= 500.0)
+					centers.push_back({ Point2f(static_cast<float>(mu.m10 / mu.m00),
+											static_cast<float>(mu.m01 / mu.m00)),
+										static_cast<float>(mu.m00) });
 			}
 
-			// Merge duplicates — keep the largest-area representative.
-			vector<Marker> unique;
-			for (const auto& m : markers)
+			// Merge duplicates within 100 px; keep the largest-area representative.
+			vector<Marker> merged;
+			for (const auto& pt : centers)
 			{
-				bool dup = false;
-				for (auto& u : unique)
+				bool isNew = true;
+				for (auto& m : merged)
 				{
-					if (norm(m.center - u.center) < mergeDist)
+					if (norm(pt.center - m.center) < 100.0f)
 					{
-						if (m.area > u.area) u = m;
-						dup = true;
+						if (pt.area > m.area) m = pt;
+						isNew = false;
 						break;
 					}
 				}
-				if (!dup) unique.push_back(m);
+				if (isNew) merged.push_back(pt);
 			}
-			markers = unique;
+			return merged;
+		}
 
-			if (markers.size() < 3) return false;
+		// Locate the four perspective corners TL/TR/BR/BL.
+		// Algorithm: modify/warp_engine.cpp (FindMarkerCenters + anti-perspective-
+		// inversion module + rotation module).
+		bool locateCorners(const Mat& srcImg,
+			Point2f& tl, Point2f& tr, Point2f& br, Point2f& bl)
+		{
+			// Pre-scale to ≤800 px (warp_engine.cpp: scale = 800/max(w,h)).
+			const float scale = 800.0f / static_cast<float>(std::max(srcImg.cols, srcImg.rows));
+			Mat small;
+			if (scale < 1.0f)
+				resize(srcImg, small, Size(), scale, scale, INTER_AREA);
+			else
+				small = srcImg;
 
-			// Sort by area descending; the three largest are the structural finders.
-			std::sort(markers.begin(), markers.end(),
-				[](const Marker& a, const Marker& b) { return a.area > b.area; });
+			vector<Marker> smallMarkers = findMarkers(small);
+			if (smallMarkers.size() < 4) return false;
 
-			// The marker farthest from its two neighbours (i.e. at the right-angle corner) is TL.
-			double maxDist = 0.0;
-			int    rightAngleIdx = -1;
-			for (int i = 0; i < 3; ++i)
-				for (int j = i + 1; j < 3; ++j)
-				{
-					const double d = norm(markers[i].center - markers[j].center);
-					if (d > maxDist) { maxDist = d; rightAngleIdx = 3 - i - j; }
-				}
+			// Scale marker centres back to original-image coordinates.
+			vector<Marker> markers;
+			markers.reserve(smallMarkers.size());
+			for (const auto& m : smallMarkers)
+				markers.push_back({ m.center / scale, m.area });
 
-			const Point2f tlCand = markers[rightAngleIdx].center;
-			const Point2f pt1 = markers[(rightAngleIdx + 1) % 3].center;
-			const Point2f pt2 = markers[(rightAngleIdx + 2) % 3].center;
+			// Keep the 4 farthest from the approximate centre (same as warp_engine.cpp).
+			Point2f approxCenter(0.0f, 0.0f);
+			for (const auto& p : markers) approxCenter += p.center;
+			approxCenter /= static_cast<float>(markers.size());
 
-			const Point2f v1 = pt1 - tlCand;
-			const Point2f v2 = pt2 - tlCand;
-			const double  len1 = norm(v1);
-			const double  len2 = norm(v2);
-
-			// Validate near-right-angle geometry.
-			const double legRatio = len1 / std::max(len2, 1.0);
-			if (legRatio < 0.4 || legRatio > 2.5) return false;
-			const double cosTheta = (v1.x * v2.x + v1.y * v2.y) / std::max(len1 * len2, 1.0);
-			if (std::abs(cosTheta) > 0.75) return false;
-
-			// Cross product determines which leg is TR and which is BL.
-			const double cross = v1.x * v2.y - v1.y * v2.x;
-			Point2f trCand, blCand;
-			if (cross > 0) { trCand = pt1; blCand = pt2; }
-			else { trCand = pt2; blCand = pt1; }
-
-			// BR: use the detected 4th marker if close to the parallelogram prediction,
-			// otherwise estimate it.
-			Point2f brCand = trCand + blCand - tlCand;
-			const double maxLeg = std::max(len1, len2);
-			if (markers.size() > 3)
+			if (markers.size() > 4)
 			{
-				double minD = 1e9;
-				int    bestIdx = -1;
-				for (size_t i = 3; i < markers.size(); ++i)
-				{
-					const double d = norm(markers[i].center - brCand);
-					if (d < minD) { minD = d; bestIdx = static_cast<int>(i); }
-				}
-				if (bestIdx >= 0 && minD < maxLeg * 0.4)
-					brCand = markers[bestIdx].center;
+				std::sort(markers.begin(), markers.end(),
+					[&](const Marker& a, const Marker& b)
+					{
+						return norm(a.center - approxCenter) > norm(b.center - approxCenter);
+					});
+				markers.resize(4);
 			}
 
-			tl = tlCand;
-			tr = trCand;
-			br = brCand;
-			bl = blCand;
+			Point2f exactCenter(0.0f, 0.0f);
+			for (const auto& p : markers) exactCenter += p.center;
+			exactCenter /= 4.0f;
+
+			// ── Anti-perspective-inversion module (warp_engine.cpp) ──────────────
+			// BR marker has the smallest area/dist² ratio (it is slightly smaller
+			// and farther-equivalent because of perspective foreshortening).
+			int   brIdx    = -1;
+			float minRatio = 1e9f;
+			for (int i = 0; i < 4; ++i)
+			{
+				const float d     = static_cast<float>(norm(markers[i].center - exactCenter));
+				const float ratio = markers[i].area / std::max(d * d, 1.0f);
+				if (ratio < minRatio) { minRatio = ratio; brIdx = i; }
+			}
+			const Point2f brPoint = markers[brIdx].center;
+
+			// ── Rotation module (warp_engine.cpp) ─────────────────────────────────
+			// Sort all four centres by angle around exactCenter, then assign
+			// br / bl / tl / tr starting from brIdx going counter-clockwise
+			// (next = bl, opposite = tl, previous = tr).
+			vector<Point2f> sorted;
+			sorted.reserve(4);
+			for (const auto& m : markers) sorted.push_back(m.center);
+			std::sort(sorted.begin(), sorted.end(),
+				[&](Point2f a, Point2f b)
+				{
+					return std::atan2(a.y - exactCenter.y, a.x - exactCenter.x)
+						<  std::atan2(b.y - exactCenter.y, b.x - exactCenter.x);
+				});
+
+			int sortedBrIdx = 0;
+			for (int i = 0; i < 4; ++i)
+			{
+				if (norm(sorted[i] - brPoint) < 1.0f) { sortedBrIdx = i; break; }
+			}
+
+			br = sorted[sortedBrIdx];
+			bl = sorted[(sortedBrIdx + 1) % 4];
+			tl = sorted[(sortedBrIdx + 2) % 4];
+			tr = sorted[(sortedBrIdx + 3) % 4];
 			return true;
 		}
 	}
@@ -307,44 +303,42 @@ namespace ImgParse
 			return false;
 		}
 
-		// Grid constants: the barcode is a 133×133 cell grid.
-		// Finder-marker centres land at cell 21 (TL/TR/BL) and cell ~253.5 (BR).
-		// kFinderSpan is the cell distance between TL and TR/BL finder centres (112 cells).
-		constexpr float kMarkerTL    = 21.0f;   // finder centre position (TL, TR, BL axes)
-		constexpr float kMarkerTR    = 245.0f;  // finder centre position (TR col, BL row)
-		constexpr float kMarkerBR    = 253.5f;  // finder centre position for BR corner
-		constexpr int   kBarcodeGrid = 133;     // full grid dimension in cells
-		constexpr int   kFinderSpan  = 112;     // finder-centre-to-finder-centre distance
-
-		// Per-pixel voting at 266×266 resolution (matching code.cpp's encoding):
-		// 1. Warp original grayscale to a "natural" barcode pixel size (targetSize).
-		// 2a. INTER_AREA resize to the largest multiple of 266 ≤ targetSize so that
-		//     every intermediate pixel covers an integer number of warped pixels.
-		// 2b. INTER_AREA final resize to 266×266 — integer ratio → clean per-pixel vote.
-		// 3. Compute Otsu threshold from data-region pixels only (header + 5 data areas +
-		//    corner cells) so finder-pattern and safe-area pixels don't bias the histogram.
-		// 4. Classify every 266×266 pixel independently as black or white.
+		// Per-pixel voting (matching code.cpp's encoding):
+		// 1. Locate four corners using the FindMarkerCenters algorithm from
+		//    modify/warp_engine.cpp (2-level nesting, HSV sat suppression, fixed
+		//    blockSize=101/C=15, anti-perspective-inversion, rotation module).
+		// 2. Warp original grayscale to the natural barcode pixel size (targetSize),
+		//    using the white-border pad/correct fractions from warp_engine.cpp.
+		// 2a. INTER_AREA resize to the largest multiple of 266 ≤ targetSize.
+		// 2b. INTER_AREA final resize to 266×266 — clean per-pixel vote.
+		// 3. Compute Otsu threshold from data-region pixels only.
+		// 4. Classify every pixel as black or white.
 		auto warpBW = [&](Point2f tl, Point2f tr, Point2f br, Point2f bl) -> bool
 			{
 				Mat grayFull;
 				if (srcImg.channels() == 3) cvtColor(srcImg, grayFull, COLOR_BGR2GRAY);
 				else                        grayFull = srcImg.clone();
 
-				// Estimate natural barcode side length in source pixels.
-				const double edgeLen = std::min(norm(tr - tl), norm(bl - tl));
+				// Estimate natural barcode pixel size from the finder-centre span.
+				// In the warp_engine.cpp mapping: finder span = targetSize*(1-2*0.05225).
+				// → targetSize = edgeLen / (1 - 2*0.05225) ≈ edgeLen / 0.8955.
+				const float edgeLen = static_cast<float>(
+					std::min(norm(tr - tl), norm(bl - tl)));
 				const int targetSize = std::max(kFrameSize,
-					static_cast<int>(std::round(edgeLen * kBarcodeGrid / kFinderSpan)));
+					static_cast<int>(std::round(edgeLen / 0.8955f)));
 
-				const float k = static_cast<float>(targetSize) / kFrameSize;
+				// White-border-elimination + direction-correction fractions
+				// from warp_engine.cpp (hand-tuned, do not change).
+				const float padX    = targetSize * 0.05225f;
+				const float padY    = targetSize * 0.05225f;
+				const float correct = targetSize * 0.0160f;
 
-				// Map finder centres to their known pixel positions in the 266 frame,
-				// scaled up to targetSize.
 				const vector<Point2f> srcPts = { tl, tr, br, bl };
 				const vector<Point2f> dstPts = {
-					Point2f(kMarkerTL * k, kMarkerTL * k),
-					Point2f(kMarkerTR * k, kMarkerTL * k),
-					Point2f(kMarkerBR * k, kMarkerBR * k),
-					Point2f(kMarkerTL * k, kMarkerTR * k)
+					Point2f(padX,                               padY),
+					Point2f(targetSize - 1.0f - padX,           padY),
+					Point2f(targetSize - 1.0f - padX - correct, targetSize - 1.0f - padY - correct),
+					Point2f(padX,                               targetSize - 1.0f - padY)
 				};
 				const Mat M = getPerspectiveTransform(srcPts, dstPts);
 
@@ -353,11 +347,9 @@ namespace ImgParse
 				warpPerspective(grayFull, warped, M, Size(targetSize, targetSize), INTER_LINEAR);
 
 				// Step 2a: INTER_AREA resize to the largest multiple of 266 that is
-				// ≤ targetSize.  This makes each cell an integer number of pixels, so
-				// the subsequent final resize (step 2b) is a clean integer ratio with
-				// no fractional-pixel artifacts.
+				// ≤ targetSize so every cell covers an integer number of warped pixels.
 				Mat intermediate;
-				const int scale = std::max(1, targetSize / kFrameSize);
+				const int scale  = std::max(1, targetSize / kFrameSize);
 				const int midSize = scale * kFrameSize;
 				if (midSize < targetSize)
 					resize(warped, intermediate, Size(midSize, midSize), 0, 0, INTER_AREA);
@@ -376,16 +368,14 @@ namespace ImgParse
 				return true;
 			};
 
-		// Try detection without HSV assist, then with.
-		const int passes = (srcImg.channels() == 3) ? 2 : 1;
-		for (int pass = 0; pass < passes; ++pass)
+		// Try detection using the warp_engine.cpp algorithm.
 		{
 			Point2f tl, tr, br, bl;
-			if (!locateCorners(srcImg, pass == 1, tl, tr, br, bl))
-				continue;
-
-			g_cachedCorners = { tl, tr, br, bl, true };
-			return warpBW(tl, tr, br, bl);
+			if (locateCorners(srcImg, tl, tr, br, bl))
+			{
+				g_cachedCorners = { tl, tr, br, bl, true };
+				return warpBW(tl, tr, br, bl);
+			}
 		}
 
 		// Fall back to cached corners from the previous successful frame.
