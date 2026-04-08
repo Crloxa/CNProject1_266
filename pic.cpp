@@ -318,8 +318,9 @@ namespace ImgParse
 
 		// Per-pixel voting at 266×266 resolution (matching code.cpp's encoding):
 		// 1. Warp original grayscale to a "natural" barcode pixel size (targetSize).
-		// 2. INTER_AREA downsample to 266×266 — each output pixel is the area-weighted
-		//    average of every warped source pixel in its region: the true per-pixel vote.
+		// 2a. INTER_AREA resize to the largest multiple of 266 ≤ targetSize so that
+		//     every intermediate pixel covers an integer number of warped pixels.
+		// 2b. INTER_AREA final resize to 266×266 — integer ratio → clean per-pixel vote.
 		// 3. Compute Otsu threshold from data-region pixels only (header + 5 data areas +
 		//    corner cells) so finder-pattern and safe-area pixels don't bias the histogram.
 		// 4. Classify every 266×266 pixel independently as black or white.
@@ -351,9 +352,21 @@ namespace ImgParse
 				Mat warped;
 				warpPerspective(grayFull, warped, M, Size(targetSize, targetSize), INTER_LINEAR);
 
-				// Step 2: INTER_AREA downsample → per-pixel vote at 266×266.
+				// Step 2a: INTER_AREA resize to the largest multiple of 266 that is
+				// ≤ targetSize.  This makes each cell an integer number of pixels, so
+				// the subsequent final resize (step 2b) is a clean integer ratio with
+				// no fractional-pixel artifacts.
+				Mat intermediate;
+				const int scale = std::max(1, targetSize / kFrameSize);
+				const int midSize = scale * kFrameSize;
+				if (midSize < targetSize)
+					resize(warped, intermediate, Size(midSize, midSize), 0, 0, INTER_AREA);
+				else
+					intermediate = warped;
+
+				// Step 2b: INTER_AREA final downsample → per-pixel vote at 266×266.
 				Mat avg266;
-				resize(warped, avg266, Size(kFrameSize, kFrameSize), 0, 0, INTER_AREA);
+				resize(intermediate, avg266, Size(kFrameSize, kFrameSize), 0, 0, INTER_AREA);
 
 				// Step 3: data-only Otsu (unbiased by finder patterns / safe area).
 				const double thresh = dataOtsuThresh(avg266);
