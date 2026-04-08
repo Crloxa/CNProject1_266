@@ -243,11 +243,15 @@ namespace ImgParse
 		constexpr int   kBarcodeGrid = 133;     // full grid dimension in cells
 		constexpr int   kFinderSpan  = 112;     // finder-centre-to-finder-centre distance
 
-		// Forward-warp approach (reference: pic_color.cpp):
+		// Per-cell voting approach (reference: pic_color.cpp drawDataGridAndStars):
 		// 1. Warp original grayscale to the barcode's natural pixel size (targetSize).
-		// 2. Resize to 266×266 with INTER_AREA — true proportional voting: each output
-		//    cell averages every source pixel in its corresponding region, avoiding moiré.
-		// 3. Otsu threshold → output as CV_8UC3.
+		// 2. For each of 133×133 cells, average all source pixels that fall in that
+		//    cell's region → per-cell mean values.  This is the "vote" per cell.
+		// 3. Compute Otsu threshold from the 133×133 cell means only (not the full
+		//    warped image) so the threshold is not biased by margins or finder patterns.
+		// 4. Classify each cell as white (mean > threshold) or black.
+		// 5. Write 2×2 pixel blocks into the 266×266 output (ImgDecode reads individual
+		//    pixels; cell (r,c) occupies rows {2r, 2r+1} × cols {2c, 2c+1}).
 		auto warpBW = [&](Point2f tl, Point2f tr, Point2f br, Point2f bl) -> bool
 			{
 				Mat grayFull;
@@ -255,7 +259,6 @@ namespace ImgParse
 				else                        grayFull = srcImg.clone();
 
 				// Estimate natural barcode side length in source pixels.
-				// Finder-marker centres are kFinderSpan/kBarcodeGrid of the full barcode.
 				const double edgeLen = std::min(norm(tr - tl), norm(bl - tl));
 				const int targetSize = std::max(kFrameSize,
 					static_cast<int>(std::round(edgeLen * kBarcodeGrid / kFinderSpan)));
@@ -276,15 +279,50 @@ namespace ImgParse
 				Mat warped;
 				warpPerspective(grayFull, warped, M, Size(targetSize, targetSize), INTER_LINEAR);
 
-				// Step 2: resize to 266×266 with INTER_AREA (proportional voting).
-				Mat resized266;
-				resize(warped, resized266, Size(kFrameSize, kFrameSize), 0, 0, INTER_AREA);
+				// Step 2: per-cell voting — average each cell's pixels into one value.
+				const double cellSize = static_cast<double>(targetSize) / kBarcodeGrid;
+				std::vector<uint8_t> cellMeans(kBarcodeGrid * kBarcodeGrid);
+				for (int row = 0; row < kBarcodeGrid; ++row)
+				{
+					for (int col = 0; col < kBarcodeGrid; ++col)
+					{
+						const int x0 = static_cast<int>(col * cellSize);
+						const int y0 = static_cast<int>(row * cellSize);
+						const int x1 = std::min(static_cast<int>((col + 1) * cellSize), targetSize);
+						const int y1 = std::min(static_cast<int>((row + 1) * cellSize), targetSize);
+						const Rect roi(x0, y0,
+							std::max(1, x1 - x0),
+							std::max(1, y1 - y0));
+						cellMeans[row * kBarcodeGrid + col] =
+							static_cast<uint8_t>(cv::mean(warped(roi))[0]);
+					}
+				}
 
-				// Step 3: Otsu threshold → output as CV_8UC3.
-				Mat bin;
-				threshold(resized266, bin, 0, 255, THRESH_BINARY | THRESH_OTSU);
+				// Step 3: Otsu threshold computed from cell means only.
+				// Wrapping the flat array into a Mat lets threshold() build the histogram.
+				const Mat cellMat(kBarcodeGrid, kBarcodeGrid, CV_8U, cellMeans.data());
+				Mat tmpBin;
+				const double thresh = threshold(cellMat, tmpBin, 0, 255,
+					THRESH_BINARY | THRESH_OTSU);
 
-				cvtColor(bin, disImg, COLOR_GRAY2BGR);
+				// Step 4+5: classify and write 2×2 pixel blocks.
+				// 266 = 2 × 133, so cell (row, col) → rows {2*row, 2*row+1},
+				// cols {2*col, 2*col+1} in the 266×266 output.
+				disImg.create(kFrameSize, kFrameSize, CV_8UC3);
+				for (int row = 0; row < kBarcodeGrid; ++row)
+				{
+					for (int col = 0; col < kBarcodeGrid; ++col)
+					{
+						const Vec3b color =
+							(cellMeans[row * kBarcodeGrid + col] > static_cast<uint8_t>(thresh))
+							? Vec3b(255, 255, 255)
+							: Vec3b(0, 0, 0);
+						disImg.at<Vec3b>(row * 2,     col * 2)     = color;
+						disImg.at<Vec3b>(row * 2,     col * 2 + 1) = color;
+						disImg.at<Vec3b>(row * 2 + 1, col * 2)     = color;
+						disImg.at<Vec3b>(row * 2 + 1, col * 2 + 1) = color;
+					}
+				}
 				return true;
 			};
 
