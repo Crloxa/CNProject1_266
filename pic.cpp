@@ -13,6 +13,82 @@ namespace ImgParse
 	{
 		constexpr int   kFrameSize = 266;
 
+		// ── Layout constants (must match code.cpp / ImgDecode.cpp exactly) ──────────
+		// Header: 3 rows × 16 columns of 1-pixel-wide bits.
+		constexpr int kHdrTop  = 6;
+		constexpr int kHdrLeft = 42;
+		constexpr int kHdrH    = 3;
+		constexpr int kHdrW    = 16;
+
+		// Data areas (rows, cols, h, w) — identical to code.cpp kDataAreas.
+		struct DataArea { int top, left, h, w; };
+		constexpr DataArea kDataAreas[5] = {
+			{6,   58, 3,   166},   // top-right strip
+			{9,   42, 33,  182},   // upper-middle band
+			{42,  5,  179, 256},   // main data block
+			{221, 5,  3,   256},   // lower-middle band
+			{224, 42, 37,  182},   // bottom strip
+		};
+
+		// Corner data cell region: rows/cols in [kCornerStart, kFrameSize),
+		// minus the quiet zone (row≥kSqrQuiet or col≥kSqrQuiet) and the
+		// safety zone ([kSqrSafetyS, kSqrSafetyE] × [kSqrSafetyS, kSqrSafetyE]).
+		// All thresholds derived from code.cpp constants (SmallQrPointbias=14, Radius=6,
+		// CornerReserveSize=42).
+		constexpr int kCornerStart  = kFrameSize - 42; // 224
+		constexpr int kSqrQuiet     = 260;             // SmallQrPointEnd + 1 = 259 + 1
+		constexpr int kSqrSafetyS   = 242;             // SmallQrPointStart - 4
+		constexpr int kSqrSafetyE   = 263;             // SmallQrPointEnd   + 4
+
+		// Collect pixel values from every signal-bearing position in a 266×266 grayscale
+		// image for use as the Otsu histogram.  Excludes the safe-area border, the three
+		// large finder patterns, and the small BR finder — so the threshold is calibrated
+		// purely to the data black/white distribution and not biased by structure pixels.
+		double dataOtsuThresh(const Mat& gray266)
+		{
+			std::vector<uint8_t> vals;
+			vals.reserve(64000);
+
+			// Header pixels.
+			for (int r = kHdrTop; r < kHdrTop + kHdrH; ++r)
+				for (int c = kHdrLeft; c < kHdrLeft + kHdrW; ++c)
+					vals.push_back(gray266.at<uint8_t>(r, c));
+
+			// Five data areas.
+			for (const auto& a : kDataAreas)
+				for (int r = a.top; r < a.top + a.h && r < kFrameSize; ++r)
+					for (int c = a.left; c < a.left + a.w && c < kFrameSize; ++c)
+						vals.push_back(gray266.at<uint8_t>(r, c));
+
+			// Corner data cells (replicates code.cpp buildCornerDataCells logic).
+			for (int r = kCornerStart; r < kFrameSize; ++r)
+				for (int c = kCornerStart; c < kFrameSize; ++c)
+				{
+					if (r >= kSqrQuiet || c >= kSqrQuiet) continue;
+					if (r >= kSqrSafetyS && r <= kSqrSafetyE
+						&& c >= kSqrSafetyS && c <= kSqrSafetyE) continue;
+					vals.push_back(gray266.at<uint8_t>(r, c));
+				}
+
+			if (vals.empty()) return 127.0;
+			const Mat m(1, static_cast<int>(vals.size()), CV_8U, vals.data());
+			Mat tmp;
+			return threshold(m, tmp, 0, 255, THRESH_BINARY | THRESH_OTSU);
+		}
+
+		// Apply a fixed threshold to every pixel and write the result as a
+		// 266×266 CV_8UC3 pure-black-or-white image ready for ImageDecode::Main.
+		void applyPixelBinary(const Mat& gray266, double thresh, Mat& out)
+		{
+			out.create(kFrameSize, kFrameSize, CV_8UC3);
+			const uint8_t t = static_cast<uint8_t>(thresh);
+			for (int r = 0; r < kFrameSize; ++r)
+				for (int c = 0; c < kFrameSize; ++c)
+					out.at<Vec3b>(r, c) = (gray266.at<uint8_t>(r, c) > t)
+						? Vec3b(255, 255, 255)
+						: Vec3b(0, 0, 0);
+		}
+
 		struct Marker
 		{
 			Point2f center;
@@ -205,8 +281,8 @@ namespace ImgParse
 			g_cachedCorners.valid = false;
 		}
 
-		// Square-input fast path: resize with INTER_AREA (proportional voting over source
-		// pixels per output cell), then Otsu binarize the averaged 266×266 result.
+		// Square-input fast path: INTER_AREA downsample to 266×266 (per-pixel vote),
+		// then data-only Otsu binarize and write pixel-by-pixel.
 		const double aspect = static_cast<double>(srcImg.cols) / srcImg.rows;
 		if (aspect > 0.95 && aspect < 1.05 && srcImg.cols > 200)
 		{
@@ -214,16 +290,13 @@ namespace ImgParse
 			if (srcImg.channels() == 3) cvtColor(srcImg, imgGray, COLOR_BGR2GRAY);
 			else                        imgGray = srcImg.clone();
 
-			// INTER_AREA averages all source pixels that map into each output cell —
-			// this is the proportional majority vote on the original image.
-			Mat resized266;
-			resize(imgGray, resized266, Size(kFrameSize, kFrameSize), 0, 0, INTER_AREA);
+			// INTER_AREA: each output pixel is the area-weighted average of every
+			// source pixel that maps to it — the true per-pixel proportional vote.
+			Mat avg266;
+			resize(imgGray, avg266, Size(kFrameSize, kFrameSize), 0, 0, INTER_AREA);
 
-			// After averaging, the histogram is cleanly bimodal; Otsu is reliable here.
-			Mat bin266;
-			threshold(resized266, bin266, 0, 255, THRESH_BINARY | THRESH_OTSU);
-
-			cvtColor(bin266, disImg, COLOR_GRAY2BGR);
+			const double thresh = dataOtsuThresh(avg266);
+			applyPixelBinary(avg266, thresh, disImg);
 			return true;
 		}
 
@@ -243,15 +316,13 @@ namespace ImgParse
 		constexpr int   kBarcodeGrid = 133;     // full grid dimension in cells
 		constexpr int   kFinderSpan  = 112;     // finder-centre-to-finder-centre distance
 
-		// Per-cell voting approach (reference: pic_color.cpp drawDataGridAndStars):
-		// 1. Warp original grayscale to the barcode's natural pixel size (targetSize).
-		// 2. For each of 133×133 cells, average all source pixels that fall in that
-		//    cell's region → per-cell mean values.  This is the "vote" per cell.
-		// 3. Compute Otsu threshold from the 133×133 cell means only (not the full
-		//    warped image) so the threshold is not biased by margins or finder patterns.
-		// 4. Classify each cell as white (mean > threshold) or black.
-		// 5. Write 2×2 pixel blocks into the 266×266 output (ImgDecode reads individual
-		//    pixels; cell (r,c) occupies rows {2r, 2r+1} × cols {2c, 2c+1}).
+		// Per-pixel voting at 266×266 resolution (matching code.cpp's encoding):
+		// 1. Warp original grayscale to a "natural" barcode pixel size (targetSize).
+		// 2. INTER_AREA downsample to 266×266 — each output pixel is the area-weighted
+		//    average of every warped source pixel in its region: the true per-pixel vote.
+		// 3. Compute Otsu threshold from data-region pixels only (header + 5 data areas +
+		//    corner cells) so finder-pattern and safe-area pixels don't bias the histogram.
+		// 4. Classify every 266×266 pixel independently as black or white.
 		auto warpBW = [&](Point2f tl, Point2f tr, Point2f br, Point2f bl) -> bool
 			{
 				Mat grayFull;
@@ -265,7 +336,8 @@ namespace ImgParse
 
 				const float k = static_cast<float>(targetSize) / kFrameSize;
 
-				// Build transform: finder-marker centres → scaled positions in targetSize space.
+				// Map finder centres to their known pixel positions in the 266 frame,
+				// scaled up to targetSize.
 				const vector<Point2f> srcPts = { tl, tr, br, bl };
 				const vector<Point2f> dstPts = {
 					Point2f(kMarkerTL * k, kMarkerTL * k),
@@ -275,54 +347,19 @@ namespace ImgParse
 				};
 				const Mat M = getPerspectiveTransform(srcPts, dstPts);
 
-				// Step 1: forward-warp to natural barcode size.
+				// Step 1: warp to natural barcode size.
 				Mat warped;
 				warpPerspective(grayFull, warped, M, Size(targetSize, targetSize), INTER_LINEAR);
 
-				// Step 2: per-cell voting — average each cell's pixels into one value.
-				const double cellSize = static_cast<double>(targetSize) / kBarcodeGrid;
-				std::vector<uint8_t> cellMeans(kBarcodeGrid * kBarcodeGrid);
-				for (int row = 0; row < kBarcodeGrid; ++row)
-				{
-					for (int col = 0; col < kBarcodeGrid; ++col)
-					{
-						const int x0 = static_cast<int>(col * cellSize);
-						const int y0 = static_cast<int>(row * cellSize);
-						const int x1 = std::min(static_cast<int>((col + 1) * cellSize), targetSize);
-						const int y1 = std::min(static_cast<int>((row + 1) * cellSize), targetSize);
-						const Rect roi(x0, y0,
-							std::max(1, x1 - x0),
-							std::max(1, y1 - y0));
-						cellMeans[row * kBarcodeGrid + col] =
-							static_cast<uint8_t>(cv::mean(warped(roi))[0]);
-					}
-				}
+				// Step 2: INTER_AREA downsample → per-pixel vote at 266×266.
+				Mat avg266;
+				resize(warped, avg266, Size(kFrameSize, kFrameSize), 0, 0, INTER_AREA);
 
-				// Step 3: Otsu threshold computed from cell means only.
-				// Wrapping the flat array into a Mat lets threshold() build the histogram.
-				const Mat cellMat(kBarcodeGrid, kBarcodeGrid, CV_8U, cellMeans.data());
-				Mat tmpBin;
-				const double thresh = threshold(cellMat, tmpBin, 0, 255,
-					THRESH_BINARY | THRESH_OTSU);
+				// Step 3: data-only Otsu (unbiased by finder patterns / safe area).
+				const double thresh = dataOtsuThresh(avg266);
 
-				// Step 4+5: classify and write 2×2 pixel blocks.
-				// 266 = 2 × 133, so cell (row, col) → rows {2*row, 2*row+1},
-				// cols {2*col, 2*col+1} in the 266×266 output.
-				disImg.create(kFrameSize, kFrameSize, CV_8UC3);
-				for (int row = 0; row < kBarcodeGrid; ++row)
-				{
-					for (int col = 0; col < kBarcodeGrid; ++col)
-					{
-						const Vec3b color =
-							(cellMeans[row * kBarcodeGrid + col] > static_cast<uint8_t>(thresh))
-							? Vec3b(255, 255, 255)
-							: Vec3b(0, 0, 0);
-						disImg.at<Vec3b>(row * 2,     col * 2)     = color;
-						disImg.at<Vec3b>(row * 2,     col * 2 + 1) = color;
-						disImg.at<Vec3b>(row * 2 + 1, col * 2)     = color;
-						disImg.at<Vec3b>(row * 2 + 1, col * 2 + 1) = color;
-					}
-				}
+				// Step 4: per-pixel black/white classification.
+				applyPixelBinary(avg266, thresh, disImg);
 				return true;
 			};
 
