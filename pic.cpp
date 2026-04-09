@@ -16,7 +16,7 @@ namespace ImgParse
 		constexpr int   kAdaptiveC = 3;
 		constexpr double kClaheClipLimit = 2.0;
 		constexpr int   kClaheGridSize = 8;
-		constexpr int   kSmoothKernel = 3;
+		constexpr int   kSmoothKernel = 5;
 
 		struct Marker
 		{
@@ -38,13 +38,15 @@ namespace ImgParse
 			else                     gray = src.clone();
 
 			Mat contrast;
-			static Ptr<CLAHE> clahe = createCLAHE(kClaheClipLimit, Size(kClaheGridSize, kClaheGridSize));
+			thread_local Ptr<CLAHE> clahe = createCLAHE(kClaheClipLimit, Size(kClaheGridSize, kClaheGridSize));
 			clahe->apply(gray, contrast);
 
 			Mat smooth;
 			GaussianBlur(contrast, smooth, Size(kSmoothKernel, kSmoothKernel), 0);
 
 			Mat binRaw;
+			// For 266x266 output, a small local window preserves cell edges while CLAHE + blur
+			// suppresses color cast and sensor noise before thresholding.
 			adaptiveThreshold(smooth, binRaw, 255,
 				ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY, kAdaptiveBlockSize, kAdaptiveC);
 
