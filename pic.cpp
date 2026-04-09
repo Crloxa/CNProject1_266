@@ -47,12 +47,7 @@ namespace ImgParse
 			Mat binRaw;
 			threshold(denoise, binRaw, 0, 255, THRESH_BINARY | THRESH_OTSU);
 			if (binRaw.empty()) return false;
-			if (binRaw.rows != kFrameSize || binRaw.cols != kFrameSize)
-			{
-				Mat resizedBin;
-				resize(binRaw, resizedBin, Size(kFrameSize, kFrameSize), 0, 0, INTER_NEAREST);
-				binRaw = resizedBin;
-			}
+			if (binRaw.rows != kFrameSize || binRaw.cols != kFrameSize) return false;
 
 			cvtColor(binRaw, disImg, COLOR_GRAY2BGR);
 			return !disImg.empty()
