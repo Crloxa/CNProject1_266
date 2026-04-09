@@ -46,9 +46,19 @@ namespace ImgParse
 
 			Mat binRaw;
 			threshold(denoise, binRaw, 0, 255, THRESH_BINARY | THRESH_OTSU);
+			if (binRaw.empty()) return false;
+			if (binRaw.rows != kFrameSize || binRaw.cols != kFrameSize)
+			{
+				Mat resizedBin;
+				resize(binRaw, resizedBin, Size(kFrameSize, kFrameSize), 0, 0, INTER_NEAREST);
+				binRaw = resizedBin;
+			}
 
 			cvtColor(binRaw, disImg, COLOR_GRAY2BGR);
-			return true;
+			return !disImg.empty()
+				&& disImg.rows == kFrameSize
+				&& disImg.cols == kFrameSize
+				&& disImg.type() == CV_8UC3;
 		}
 
 		// Find the child contour of parentIdx with the largest area (from modify/pic.cpp).
