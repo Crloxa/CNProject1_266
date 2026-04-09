@@ -12,16 +12,11 @@ namespace ImgParse
 	namespace
 	{
 		constexpr int   kFrameSize = 266;
-		// Tuned for 266x266 decode frames from video capture.
-		constexpr int   kAdaptiveBlockSize = 11;
-		constexpr int   kAdaptiveC = 2;
 		// CLAHE settings for moderate local contrast boost without halo artifacts.
 		constexpr double kClaheClipLimit = 2.0;
 		constexpr int   kClaheGridSize = 8;
-		// Light denoise before adaptive threshold while preserving module edges.
-		constexpr int   kSmoothKernel = 5;
-		static_assert((kAdaptiveBlockSize % 2) == 1 && kAdaptiveBlockSize > 1,
-			"kAdaptiveBlockSize must be odd and > 1 for adaptiveThreshold");
+		// Light denoise before global threshold to suppress isolated sensor noise.
+		constexpr int   kMedianKernel = 3;
 
 		struct Marker
 		{
@@ -46,15 +41,11 @@ namespace ImgParse
 			Ptr<CLAHE> clahe = createCLAHE(kClaheClipLimit, Size(kClaheGridSize, kClaheGridSize));
 			clahe->apply(gray, contrast);
 
-			Mat smooth;
-			// sigmaX=0 lets OpenCV derive sigma from kernel size.
-			GaussianBlur(contrast, smooth, Size(kSmoothKernel, kSmoothKernel), 0);
+			Mat denoise;
+			medianBlur(contrast, denoise, kMedianKernel);
 
 			Mat binRaw;
-			// Tuned for 266x266 output: blockSize must be odd, and 11 balances local-lighting
-			// correction with module-edge stability after CLAHE and Gaussian smoothing.
-			adaptiveThreshold(smooth, binRaw, 255,
-				ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY, kAdaptiveBlockSize, kAdaptiveC);
+			threshold(denoise, binRaw, 0, 255, THRESH_BINARY | THRESH_OTSU);
 
 			cvtColor(binRaw, disImg, COLOR_GRAY2BGR);
 			return true;
@@ -243,9 +234,23 @@ namespace ImgParse
 		const double aspect = static_cast<double>(srcImg.cols) / srcImg.rows;
 		if (aspect > 0.95 && aspect < 1.05 && srcImg.cols > 200)
 		{
-			Mat resized;
-			resize(srcImg, resized, Size(kFrameSize, kFrameSize), 0, 0, INTER_AREA);
-			return buildBinaryOutput(resized, disImg);
+			Mat imgGray;
+			if (srcImg.channels() == 3) cvtColor(srcImg, imgGray, COLOR_BGR2GRAY);
+			else                        imgGray = srcImg.clone();
+			Mat binRaw;
+			threshold(imgGray, binRaw, 0, 255, THRESH_BINARY | THRESH_OTSU);
+			disImg.create(kFrameSize, kFrameSize, CV_8UC3);
+			const float stepX = static_cast<float>(srcImg.cols) / kFrameSize;
+			const float stepY = static_cast<float>(srcImg.rows) / kFrameSize;
+			for (int r = 0; r < kFrameSize; ++r)
+				for (int c = 0; c < kFrameSize; ++c)
+				{
+					const int px = std::min(static_cast<int>((c + 0.5f) * stepX), srcImg.cols - 1);
+					const int py = std::min(static_cast<int>((r + 0.5f) * stepY), srcImg.rows - 1);
+					const uint8_t val = binRaw.at<uint8_t>(py, px);
+					disImg.at<Vec3b>(r, c) = val ? Vec3b(255, 255, 255) : Vec3b(0, 0, 0);
+				}
+			return true;
 		}
 
 		// Warmup: skip the first few frames until detection is stable (from modify/pic.cpp).
@@ -258,7 +263,7 @@ namespace ImgParse
 		auto warpColor = [&](const Mat& M) -> bool
 			{
 				Mat warped;
-				warpPerspective(srcImg, warped, M, Size(kFrameSize, kFrameSize), INTER_LINEAR);
+				warpPerspective(srcImg, warped, M, Size(kFrameSize, kFrameSize), INTER_NEAREST);
 				return buildBinaryOutput(warped, disImg);
 			};
 
