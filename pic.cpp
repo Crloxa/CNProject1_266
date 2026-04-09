@@ -24,6 +24,29 @@ namespace ImgParse
 		int g_lastRows = 0;
 		int g_frameCount = 0;
 
+		bool buildBinaryOutput(const Mat& src, Mat& disImg)
+		{
+			if (src.empty()) return false;
+
+			Mat gray;
+			if (src.channels() == 3) cvtColor(src, gray, COLOR_BGR2GRAY);
+			else                     gray = src.clone();
+
+			Mat contrast;
+			Ptr<CLAHE> clahe = createCLAHE(2.0, Size(8, 8));
+			clahe->apply(gray, contrast);
+
+			Mat smooth;
+			GaussianBlur(contrast, smooth, Size(3, 3), 0);
+
+			Mat binRaw;
+			adaptiveThreshold(smooth, binRaw, 255,
+				ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY, 7, 3);
+
+			cvtColor(binRaw, disImg, COLOR_GRAY2BGR);
+			return true;
+		}
+
 		// Find the child contour of parentIdx with the largest area (from modify/pic.cpp).
 		int findLargestChild(int parentIdx,
 			const vector<vector<Point>>& contours,
@@ -207,23 +230,9 @@ namespace ImgParse
 		const double aspect = static_cast<double>(srcImg.cols) / srcImg.rows;
 		if (aspect > 0.95 && aspect < 1.05 && srcImg.cols > 200)
 		{
-			Mat imgGray;
-			if (srcImg.channels() == 3) cvtColor(srcImg, imgGray, COLOR_BGR2GRAY);
-			else                        imgGray = srcImg.clone();
-			Mat binRaw;
-			threshold(imgGray, binRaw, 0, 255, THRESH_BINARY | THRESH_OTSU);
-			disImg.create(kFrameSize, kFrameSize, CV_8UC3);
-			const float stepX = static_cast<float>(srcImg.cols) / kFrameSize;
-			const float stepY = static_cast<float>(srcImg.rows) / kFrameSize;
-			for (int r = 0; r < kFrameSize; ++r)
-				for (int c = 0; c < kFrameSize; ++c)
-				{
-					const int px = std::min(static_cast<int>((c + 0.5f) * stepX), srcImg.cols - 1);
-					const int py = std::min(static_cast<int>((r + 0.5f) * stepY), srcImg.rows - 1);
-					const uint8_t val = binRaw.at<uint8_t>(py, px);
-					disImg.at<Vec3b>(r, c) = val ? Vec3b(255, 255, 255) : Vec3b(0, 0, 0);
-				}
-			return true;
+			Mat resized;
+			resize(srcImg, resized, Size(kFrameSize, kFrameSize), 0, 0, INTER_AREA);
+			return buildBinaryOutput(resized, disImg);
 		}
 
 		// Warmup: skip the first few frames until detection is stable (from modify/pic.cpp).
@@ -237,20 +246,7 @@ namespace ImgParse
 			{
 				Mat warped;
 				warpPerspective(srcImg, warped, M, Size(kFrameSize, kFrameSize), INTER_LINEAR);
-				// Otsu binarize: same method as the square fast-path, produces clean black/white
-				// output for ImageDecode and eliminates moiré from the ~7x downscale.
-				Mat warpedGray;
-				cvtColor(warped, warpedGray, COLOR_BGR2GRAY);
-				Mat binRaw;
-				threshold(warpedGray, binRaw, 0, 255, THRESH_BINARY | THRESH_OTSU);
-				disImg.create(kFrameSize, kFrameSize, CV_8UC3);
-				for (int r = 0; r < kFrameSize; ++r)
-					for (int c = 0; c < kFrameSize; ++c)
-					{
-						const uint8_t val = binRaw.at<uint8_t>(r, c);
-						disImg.at<Vec3b>(r, c) = val ? Vec3b(255, 255, 255) : Vec3b(0, 0, 0);
-					}
-				return true;
+				return buildBinaryOutput(warped, disImg);
 			};
 
 		auto useCached = [&]() -> bool
