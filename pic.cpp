@@ -303,16 +303,17 @@ namespace ImgParse
 			return false;
 		}
 
-		// Per-pixel voting (matching code.cpp's encoding):
-		// 1. Locate four corners using the FindMarkerCenters algorithm from
-		//    modify/warp_engine.cpp (2-level nesting, HSV sat suppression, fixed
-		//    blockSize=101/C=15, anti-perspective-inversion, rotation module).
-		// 2. Warp original grayscale to the natural barcode pixel size (targetSize),
-		//    using the white-border pad/correct fractions from warp_engine.cpp.
-		// 2a. INTER_AREA resize to the largest multiple of 266 ≤ targetSize.
-		// 2b. INTER_AREA final resize to 266×266 — clean per-pixel vote.
-		// 3. Compute Otsu threshold from data-region pixels only.
-		// 4. Classify every pixel as black or white.
+		// Post-localization correction pipeline:
+		// 1. Locate four corners via warp_engine.cpp algorithm (UNTOUCHED).
+		// 2. warpPerspective (INTER_LINEAR) → targetSize × targetSize grayscale.
+		// 2a. INTER_AREA resize → largest 266-multiple ≤ targetSize (integer cell coverage).
+		// 2b. INTER_AREA resize → 266×266 (integer ratio, clean per-pixel vote).
+		// 3. CLAHE (clipLimit=2, tileGrid=8×8) — normalises local contrast so that
+		//    coloured finder patterns and illumination gradients do not bias binarisation.
+		// 4. adaptiveThreshold (GAUSSIAN_C, BINARY, blockSize=7, C=3) — each pixel is
+		//    classified relative to its local 7×7 Gaussian mean, correctly binarising
+		//    both coloured markers and standard black/white data cells.
+		// 5. cvtColor(GRAY→BGR) → 266×266 CV_8UC3 output for ImageDecode::Main.
 		auto warpBW = [&](Point2f tl, Point2f tr, Point2f br, Point2f bl) -> bool
 			{
 				Mat grayFull;
@@ -360,11 +361,27 @@ namespace ImgParse
 				Mat avg266;
 				resize(intermediate, avg266, Size(kFrameSize, kFrameSize), 0, 0, INTER_AREA);
 
-				// Step 3: data-only Otsu (unbiased by finder patterns / safe area).
-				const double thresh = dataOtsuThresh(avg266);
+				// Step 3: CLAHE — locally normalises contrast so that coloured finder
+				// patterns and uneven camera lighting don't bias a global threshold.
+				// tileGridSize 8×8 gives tiles of ~33×33 px ≈ 16 cells each, which
+				// is large enough to capture the local background level while still
+				// accommodating the illumination gradient across the warped image.
+				Ptr<CLAHE> clahe = createCLAHE(2.0, Size(8, 8));
+				Mat claheOut;
+				clahe->apply(avg266, claheOut);
 
-				// Step 4: per-pixel black/white classification.
-				applyPixelBinary(avg266, thresh, disImg);
+				// Step 4: Local adaptive binarisation.
+				// Each barcode cell occupies 2×2 px in the 266×266 image, so a
+				// 7-px Gaussian window covers ~3.5 cells — enough to estimate the
+				// local background without blurring across distant illumination zones.
+				// THRESH_BINARY: pixel > (gaussian_mean − C) → 255 (white/background),
+				//                otherwise → 0   (black/data or finder pattern).
+				Mat bin1ch;
+				adaptiveThreshold(claheOut, bin1ch, 255,
+					ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY, 7, 3);
+
+				// Step 5: Emit as 266×266 CV_8UC3 for ImageDecode::Main.
+				cvtColor(bin1ch, disImg, COLOR_GRAY2BGR);
 				return true;
 			};
 
