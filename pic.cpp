@@ -35,7 +35,7 @@ namespace ImgParse
 
 			Mat gray;
 			if (src.channels() == 3) cvtColor(src, gray, COLOR_BGR2GRAY);
-			else                     gray = src.clone();
+			else                     gray = src;
 
 			Mat contrast;
 			Ptr<CLAHE> clahe = createCLAHE(kClaheClipLimit, Size(kClaheGridSize, kClaheGridSize));
