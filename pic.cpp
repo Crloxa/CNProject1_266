@@ -12,8 +12,8 @@ namespace ImgParse
 	namespace
 	{
 		constexpr int   kFrameSize = 266;
-		constexpr int   kAdaptiveBlockSize = 7;
-		constexpr int   kAdaptiveC = 3;
+		constexpr int   kAdaptiveBlockSize = 11;
+		constexpr int   kAdaptiveC = 2;
 		constexpr double kClaheClipLimit = 2.0;
 		constexpr int   kClaheGridSize = 8;
 		constexpr int   kSmoothKernel = 5;
@@ -38,15 +38,15 @@ namespace ImgParse
 			else                     gray = src.clone();
 
 			Mat contrast;
-			thread_local Ptr<CLAHE> clahe = createCLAHE(kClaheClipLimit, Size(kClaheGridSize, kClaheGridSize));
+			Ptr<CLAHE> clahe = createCLAHE(kClaheClipLimit, Size(kClaheGridSize, kClaheGridSize));
 			clahe->apply(gray, contrast);
 
 			Mat smooth;
 			GaussianBlur(contrast, smooth, Size(kSmoothKernel, kSmoothKernel), 0);
 
 			Mat binRaw;
-			// For 266x266 output, a small local window preserves cell edges while CLAHE + blur
-			// suppresses color cast and sensor noise before thresholding.
+			// Tuned for 266x266 output: blockSize must be odd, and 11 balances local-lighting
+			// correction with module-edge stability after CLAHE and Gaussian smoothing.
 			adaptiveThreshold(smooth, binRaw, 255,
 				ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY, kAdaptiveBlockSize, kAdaptiveC);
 
