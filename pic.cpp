@@ -20,6 +20,8 @@ namespace ImgParse
 		constexpr int   kClaheGridSize = 8;
 		// Light denoise before adaptive threshold while preserving module edges.
 		constexpr int   kSmoothKernel = 5;
+		static_assert((kAdaptiveBlockSize % 2) == 1 && kAdaptiveBlockSize > 1,
+			"kAdaptiveBlockSize must be odd and > 1 for adaptiveThreshold");
 
 		struct Marker
 		{
@@ -45,6 +47,7 @@ namespace ImgParse
 			clahe->apply(gray, contrast);
 
 			Mat smooth;
+			// sigmaX=0 lets OpenCV derive sigma from kernel size.
 			GaussianBlur(contrast, smooth, Size(kSmoothKernel, kSmoothKernel), 0);
 
 			Mat binRaw;
