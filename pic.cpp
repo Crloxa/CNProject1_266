@@ -12,10 +12,13 @@ namespace ImgParse
 	namespace
 	{
 		constexpr int   kFrameSize = 266;
+		// Tuned for 266x266 decode frames from video capture.
 		constexpr int   kAdaptiveBlockSize = 11;
 		constexpr int   kAdaptiveC = 2;
+		// CLAHE settings for moderate local contrast boost without halo artifacts.
 		constexpr double kClaheClipLimit = 2.0;
 		constexpr int   kClaheGridSize = 8;
+		// Light denoise before adaptive threshold while preserving module edges.
 		constexpr int   kSmoothKernel = 5;
 
 		struct Marker
