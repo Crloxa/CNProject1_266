@@ -19,7 +19,9 @@ namespace ImgParse
 			double  area;
 		};
 
-		Mat g_lastValidTransform;
+		// Cached corners from the most recent successful detection.
+		struct CachedCorners { Point2f tl, tr, br, bl; bool valid = false; };
+		CachedCorners g_cachedCorners;
 		int g_lastCols = 0;
 		int g_lastRows = 0;
 		int g_frameCount = 0;
@@ -194,13 +196,13 @@ namespace ImgParse
 	{
 		if (srcImg.empty()) return false;
 
-		// Reset cached transform when input resolution changes (from modify/pic.cpp).
+		// Reset cached corners when input resolution changes.
 		if (srcImg.cols != g_lastCols || srcImg.rows != g_lastRows)
 		{
 			g_lastCols = srcImg.cols;
 			g_lastRows = srcImg.rows;
 			g_frameCount = 0;
-			g_lastValidTransform = Mat();
+			g_cachedCorners.valid = false;
 		}
 
 		// Square-input fast path: resize with INTER_AREA (proportional voting over source
@@ -225,86 +227,106 @@ namespace ImgParse
 			return true;
 		}
 
-		// Warmup: skip the first few frames until detection is stable (from modify/pic.cpp).
+		// Warmup: skip the first few frames until detection is stable.
 		if (g_frameCount < 3)
 		{
 			++g_frameCount;
 			return false;
 		}
 
-		auto warpColor = [&](const Mat& M) -> bool
+		// Grid constants: the barcode is a 133×133 cell grid.
+		// Finder-marker centres land at cell 21 (TL/TR/BL) and cell ~253.5 (BR).
+		// kFinderSpan is the cell distance between TL and TR/BL finder centres (112 cells).
+		constexpr float kMarkerTL = 21.0f;   // finder centre position (TL, TR, BL axes)
+		constexpr float kMarkerTR = 245.0f;  // finder centre position (TR col, BL row)
+		constexpr float kMarkerBR = 253.5f;  // finder centre position for BR corner
+		constexpr int   kBarcodeGrid = 133;     // full grid dimension in cells
+		constexpr int   kFinderSpan = 112;     // finder-centre-to-finder-centre distance
+
+		// Per-cell voting approach (reference: pic_color.cpp drawDataGridAndStars):
+		// 1. Warp original grayscale to the barcode's natural pixel size (targetSize).
+		// 2. For each of 133×133 cells, average all source pixels that fall in that
+		//    cell's region → per-cell mean values.  This is the "vote" per cell.
+		// 3. Compute Otsu threshold from the 133×133 cell means only (not the full
+		//    warped image) so the threshold is not biased by margins or finder patterns.
+		// 4. Classify each cell as white (mean > threshold) or black.
+		// 5. Write 2×2 pixel blocks into the 266×266 output (ImgDecode reads individual
+		//    pixels; cell (r,c) occupies rows {2r, 2r+1} × cols {2c, 2c+1}).
+		auto warpBW = [&](Point2f tl, Point2f tr, Point2f br, Point2f bl) -> bool
 			{
-				// Step 1: convert to grayscale (work on the original, unprocessed image).
 				Mat grayFull;
 				if (srcImg.channels() == 3) cvtColor(srcImg, grayFull, COLOR_BGR2GRAY);
 				else                        grayFull = srcImg.clone();
 
-				// Step 2: compute inverse perspective transform so we can map each
-				//         output cell back to its location in the original image.
-				Mat M_inv;
-				invert(M, M_inv);
+				// Estimate natural barcode side length in source pixels.
+				const double edgeLen = std::min(norm(tr - tl), norm(bl - tl));
+				const int targetSize = std::max(kFrameSize,
+					static_cast<int>(std::round(edgeLen * kBarcodeGrid / kFinderSpan)));
 
-				// Helper: map an output point (x, y) to source coordinates.
-				auto mapPt = [&](float x, float y) -> Point2f
+				const float k = static_cast<float>(targetSize) / kFrameSize;
+
+				// Build transform: finder-marker centres → scaled positions in targetSize space.
+				const vector<Point2f> srcPts = { tl, tr, br, bl };
+				const vector<Point2f> dstPts = {
+					Point2f(kMarkerTL * k, kMarkerTL * k),
+					Point2f(kMarkerTR * k, kMarkerTL * k),
+					Point2f(kMarkerBR * k, kMarkerBR * k),
+					Point2f(kMarkerTL * k, kMarkerTR * k)
+				};
+				const Mat M = getPerspectiveTransform(srcPts, dstPts);
+
+				// Step 1: forward-warp to natural barcode size.
+				Mat warped;
+				warpPerspective(grayFull, warped, M, Size(targetSize, targetSize), INTER_LINEAR);
+
+				// Step 2: per-cell voting — average each cell's pixels into one value.
+				const double cellSize = static_cast<double>(targetSize) / kBarcodeGrid;
+				std::vector<uint8_t> cellMeans(kBarcodeGrid * kBarcodeGrid);
+				for (int row = 0; row < kBarcodeGrid; ++row)
+				{
+					for (int col = 0; col < kBarcodeGrid; ++col)
 					{
-						const double wx = M_inv.at<double>(0, 0) * x + M_inv.at<double>(0, 1) * y + M_inv.at<double>(0, 2);
-						const double wy = M_inv.at<double>(1, 0) * x + M_inv.at<double>(1, 1) * y + M_inv.at<double>(1, 2);
-						const double wz = M_inv.at<double>(2, 0) * x + M_inv.at<double>(2, 1) * y + M_inv.at<double>(2, 2);
-						return Point2f(static_cast<float>(wx / wz), static_cast<float>(wy / wz));
-					};
-
-				// Step 3: estimate the local scale (source pixels per output cell) at the
-				//         image centre so we know how large a patch to sample per cell.
-				const float fc = kFrameSize / 2.0f, fr = kFrameSize / 2.0f;
-				const float scale = static_cast<float>(norm(mapPt(fc + 1.0f, fr) - mapPt(fc, fr)));
-				const int halfR = std::max(1, static_cast<int>(scale * 0.5f));
-
-				// Step 4: determine binarisation threshold from the barcode region only.
-				//         Warp the grayscale with INTER_LINEAR to get a 266×266 view of
-				//         just the barcode, then let Otsu pick the split on that bimodal
-				//         histogram.  This avoids the threshold being skewed by background
-				//         pixels outside the barcode.
-				Mat warpedForThresh;
-				warpPerspective(grayFull, warpedForThresh, M, Size(kFrameSize, kFrameSize), INTER_LINEAR);
-				Mat tmpBin;
-				const double otsuThresh = threshold(warpedForThresh, tmpBin, 0, 255, THRESH_BINARY | THRESH_OTSU);
-
-				// Step 5: for each output cell, vote proportionally on the original image.
-				//         Each cell maps back to a patch of roughly (2*halfR+1)² source
-				//         pixels.  We count how many exceed the Otsu threshold and declare
-				//         the cell white if the majority does — true proportional voting
-				//         directly on the original, without any prior binarisation step.
-				disImg.create(kFrameSize, kFrameSize, CV_8UC3);
-				const int srcCols = grayFull.cols, srcRows = grayFull.rows;
-				for (int r = 0; r < kFrameSize; ++r)
-					for (int c = 0; c < kFrameSize; ++c)
-					{
-						const Point2f sp = mapPt(static_cast<float>(c), static_cast<float>(r));
-						const int cx0 = static_cast<int>(sp.x + 0.5f);
-						const int cy0 = static_cast<int>(sp.y + 0.5f);
-						int white = 0, total = 0;
-						for (int dy = -halfR; dy <= halfR; ++dy)
-							for (int dx = -halfR; dx <= halfR; ++dx)
-							{
-								const int px = std::max(0, std::min(srcCols - 1, cx0 + dx));
-								const int py = std::max(0, std::min(srcRows - 1, cy0 + dy));
-								if (grayFull.at<uint8_t>(py, px) > static_cast<uint8_t>(otsuThresh))
-									++white;
-								++total;
-							}
-						disImg.at<Vec3b>(r, c) = (white * 2 >= total)
-							? Vec3b(255, 255, 255) : Vec3b(0, 0, 0);
+						const int x0 = static_cast<int>(col * cellSize);
+						const int y0 = static_cast<int>(row * cellSize);
+						const int x1 = std::min(static_cast<int>((col + 1) * cellSize), targetSize);
+						const int y1 = std::min(static_cast<int>((row + 1) * cellSize), targetSize);
+						const Rect roi(x0, y0,
+							std::max(1, x1 - x0),
+							std::max(1, y1 - y0));
+						cellMeans[row * kBarcodeGrid + col] =
+							static_cast<uint8_t>(cv::mean(warped(roi))[0]);
 					}
+				}
+
+				// Step 3: Otsu threshold computed from cell means only.
+				// Wrapping the flat array into a Mat lets threshold() build the histogram.
+				const Mat cellMat(kBarcodeGrid, kBarcodeGrid, CV_8U, cellMeans.data());
+				Mat tmpBin;
+				const double thresh = threshold(cellMat, tmpBin, 0, 255,
+					THRESH_BINARY | THRESH_OTSU);
+
+				// Step 4+5: classify and write 2×2 pixel blocks.
+				// 266 = 2 × 133, so cell (row, col) → rows {2*row, 2*row+1},
+				// cols {2*col, 2*col+1} in the 266×266 output.
+				disImg.create(kFrameSize, kFrameSize, CV_8UC3);
+				for (int row = 0; row < kBarcodeGrid; ++row)
+				{
+					for (int col = 0; col < kBarcodeGrid; ++col)
+					{
+						const Vec3b color =
+							(cellMeans[row * kBarcodeGrid + col] > static_cast<uint8_t>(thresh))
+							? Vec3b(255, 255, 255)
+							: Vec3b(0, 0, 0);
+						disImg.at<Vec3b>(row * 2, col * 2) = color;
+						disImg.at<Vec3b>(row * 2, col * 2 + 1) = color;
+						disImg.at<Vec3b>(row * 2 + 1, col * 2) = color;
+						disImg.at<Vec3b>(row * 2 + 1, col * 2 + 1) = color;
+					}
+				}
 				return true;
 			};
 
-		auto useCached = [&]() -> bool
-			{
-				if (g_lastValidTransform.empty()) return false;
-				return warpColor(g_lastValidTransform);
-			};
-
-		// Try detection without HSV assist, then with (from modify/pic.cpp).
+		// Try detection without HSV assist, then with.
 		const int passes = (srcImg.channels() == 3) ? 2 : 1;
 		for (int pass = 0; pass < passes; ++pass)
 		{
@@ -312,19 +334,15 @@ namespace ImgParse
 			if (!locateCorners(srcImg, pass == 1, tl, tr, br, bl))
 				continue;
 
-			// Build perspective transform using the corrected dst points (per warp_engine.cpp convention).
-			const vector<Point2f> srcPts = { tl, tr, br, bl };
-			const vector<Point2f> dstPts = {
-				Point2f(21.0f, 21.0f),
-				Point2f(245.0f, 21.0f),
-				Point2f(253.5f, 253.5f),
-				Point2f(21.0f, 245.0f)
-			};
-			const Mat M = getPerspectiveTransform(srcPts, dstPts);
-			g_lastValidTransform = M.clone();
-			return warpColor(M);
+			g_cachedCorners = { tl, tr, br, bl, true };
+			return warpBW(tl, tr, br, bl);
 		}
 
-		return useCached();
+		// Fall back to cached corners from the previous successful frame.
+		if (g_cachedCorners.valid)
+			return warpBW(g_cachedCorners.tl, g_cachedCorners.tr,
+				g_cachedCorners.br, g_cachedCorners.bl);
+
+		return false;
 	}
 } // namespace ImgParse
