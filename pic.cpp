@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <limits>
 #include <vector>
 
 namespace ImgParse
@@ -18,15 +17,6 @@ namespace ImgParse
 		constexpr int   kClaheGridSize = 8;
 		// Light denoise before global threshold to suppress isolated sensor noise.
 		constexpr int   kMedianKernel = 3;
-		// Marker extraction and corner ordering thresholds from warp_engine.cpp.
-		constexpr double kMinMarkerMomentArea = 500.0;
-		constexpr double kMarkerMergeDistance = 100.0;
-		constexpr float kPointMatchTolerance = 1.0f;
-		constexpr float kMaxScaledDimension = 800.0f;
-		constexpr int kLocateAdaptiveBlockSize = 101;
-		constexpr int kLocateAdaptiveC = 15;
-		constexpr int kLocateMorphKernel = 2;
-		constexpr double kDistanceEpsilon = 1e-6;
 		// Perspective correction fractions from warp_engine.cpp.
 		constexpr float kPadFraction = 0.05225f;
 		constexpr float kCorrectFraction = 0.0160f;
@@ -88,15 +78,17 @@ namespace ImgParse
 			return maxIdx;
 		}
 
-		// Locate the four perspective corners TL/TR/BR/BL using the same anti-inversion
-		// ordering strategy as modify/warp_engine.cpp.
+		// Locate the four perspective corners TL/TR/BR/BL using the processV15 approach
+		// from modify/pic.cpp (3-ring nested contour detection + geometry validation).
+		// useHSV: also suppress saturated-colour regions (same as modify/pic.cpp).
 		bool locateCorners(const Mat& srcImg, bool useHSV,
 			Point2f& tl, Point2f& tr, Point2f& br, Point2f& bl)
 		{
-			if (srcImg.empty()) return false;
 			Mat gray;
-			if (srcImg.channels() == 3) cvtColor(srcImg, gray, COLOR_BGR2GRAY);
-			else                        gray = srcImg.clone();
+			if (srcImg.channels() == 3)
+				cvtColor(srcImg, gray, COLOR_BGR2GRAY);
+			else
+				gray = srcImg.clone();
 
 			if (useHSV && srcImg.channels() == 3)
 			{
@@ -109,16 +101,20 @@ namespace ImgParse
 				gray.setTo(255, satMask);
 			}
 
-			float scale = kMaxScaledDimension / static_cast<float>(std::max(srcImg.cols, srcImg.rows));
-			if (scale > 1.0f) scale = 1.0f;
-			Mat smallImg;
-			resize(gray, smallImg, Size(), scale, scale, INTER_AREA);
+			const int maxDim = std::max(srcImg.cols, srcImg.rows);
 
+			int blurSz = std::max(5, static_cast<int>(maxDim * 7.0 / 1920.0));
+			if (blurSz % 2 == 0) ++blurSz;
+			Mat blurred;
+			GaussianBlur(gray, blurred, Size(blurSz, blurSz), 0);
+
+			int blockSz = std::max(31, static_cast<int>(maxDim * 31.0 / 1920.0));
+			if (blockSz % 2 == 0) ++blockSz;
 			Mat binary;
-			adaptiveThreshold(smallImg, binary, 255,
-				ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY_INV, kLocateAdaptiveBlockSize, kLocateAdaptiveC);
+			adaptiveThreshold(blurred, binary, 255,
+				ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY_INV, blockSz, 10);
 
-			Mat kernel = getStructuringElement(MORPH_CROSS, Size(kLocateMorphKernel, kLocateMorphKernel));
+			Mat kernel = getStructuringElement(MORPH_CROSS, Size(2, 2));
 			Mat closedBinary;
 			morphologyEx(binary, closedBinary, MORPH_CLOSE, kernel);
 
@@ -126,35 +122,39 @@ namespace ImgParse
 			vector<Vec4i>         hierarchy;
 			findContours(closedBinary, contours, hierarchy, RETR_TREE, CHAIN_APPROX_SIMPLE);
 
+			const double minArea = std::max(15.0, static_cast<double>(maxDim) * maxDim * 0.000004);
+			const double mergeDist = std::max(15.0, static_cast<double>(maxDim) * 0.0078);
+
 			vector<Marker> markers;
 			for (size_t i = 0; i < contours.size(); ++i)
 			{
-				int child = hierarchy[i][2];
-				int depth = 0;
-				while (child != -1)
+				const int c1 = findLargestChild(static_cast<int>(i), contours, hierarchy);
+				if (c1 < 0) continue;
+				const int c2 = findLargestChild(c1, contours, hierarchy);
+				if (c2 < 0) continue;
+				const double a0 = contourArea(contours[i]);
+				const double a1 = contourArea(contours[c1]);
+				const double a2 = contourArea(contours[c2]);
+				if (a0 < minArea) continue;
+				const double r01 = a0 / std::max(a1, 1.0);
+				const double r12 = a1 / std::max(a2, 1.0);
+				if (r01 > 1.2 && r01 < 8.0 && r12 > 1.2 && r12 < 8.0)
 				{
-					++depth;
-					child = hierarchy[child][2];
-					if (depth >= 2) break;
+					const Moments mu = moments(contours[i]);
+					if (mu.m00 != 0)
+						markers.push_back({ Point2f(static_cast<float>(mu.m10 / mu.m00),
+													static_cast<float>(mu.m01 / mu.m00)), a0 });
 				}
-				if (depth < 2) continue;
-				const Moments mu = moments(contours[i], false);
-				if (mu.m00 < kMinMarkerMomentArea) continue;
-				markers.push_back({
-					Point2f(static_cast<float>(mu.m10 / mu.m00 / scale),
-							static_cast<float>(mu.m01 / mu.m00 / scale)),
-					mu.m00 / (scale * scale)
-					});
 			}
 
-			// Merge duplicates using warp_engine distance threshold.
+			// Merge duplicates — keep the largest-area representative.
 			vector<Marker> unique;
 			for (const auto& m : markers)
 			{
 				bool dup = false;
 				for (auto& u : unique)
 				{
-					if (norm(m.center - u.center) < kMarkerMergeDistance)
+					if (norm(m.center - u.center) < mergeDist)
 					{
 						if (m.area > u.area) u = m;
 						dup = true;
@@ -165,62 +165,64 @@ namespace ImgParse
 			}
 			markers = unique;
 
-			if (markers.size() < 4) return false;
+			if (markers.size() < 3) return false;
 
-			Point2f approxCenter(0.0f, 0.0f);
-			for (const auto& m : markers) approxCenter += m.center;
-			approxCenter *= (1.0f / static_cast<float>(markers.size()));
-			if (markers.size() > 4)
-			{
-				std::sort(markers.begin(), markers.end(), [&](const Marker& a, const Marker& b) {
-					return norm(a.center - approxCenter) > norm(b.center - approxCenter);
-					});
-				markers.resize(4);
-			}
+			// Sort by area descending; the three largest are the structural finders.
+			std::sort(markers.begin(), markers.end(),
+				[](const Marker& a, const Marker& b) { return a.area > b.area; });
 
-			Point2f exactCenter(0.0f, 0.0f);
-			for (const auto& m : markers) exactCenter += m.center;
-			exactCenter *= 0.25f;
-
-			int brIdx = -1;
-			double minRatio = std::numeric_limits<double>::max();
-			for (int i = 0; i < 4; ++i)
-			{
-				const double dist = norm(markers[i].center - exactCenter);
-				if (dist < kDistanceEpsilon) continue;
-				const double ratio = markers[i].area / (dist * dist);
-				if (ratio < minRatio)
+			// The marker farthest from its two neighbours (i.e. at the right-angle corner) is TL.
+			double maxDist = 0.0;
+			int    rightAngleIdx = -1;
+			for (int i = 0; i < 3; ++i)
+				for (int j = i + 1; j < 3; ++j)
 				{
-					minRatio = ratio;
-					brIdx = i;
+					const double d = norm(markers[i].center - markers[j].center);
+					if (d > maxDist) { maxDist = d; rightAngleIdx = 3 - i - j; }
 				}
-			}
-			if (brIdx < 0) return false;
 
-			const Point2f brPoint = markers[brIdx].center;
-			vector<Point2f> sortedPts;
-			sortedPts.reserve(4);
-			for (const auto& m : markers) sortedPts.push_back(m.center);
-			std::sort(sortedPts.begin(), sortedPts.end(), [&](const Point2f& a, const Point2f& b) {
-				return std::atan2(a.y - exactCenter.y, a.x - exactCenter.x)
-					< std::atan2(b.y - exactCenter.y, b.x - exactCenter.x);
-				});
+			const Point2f tlCand = markers[rightAngleIdx].center;
+			const Point2f pt1 = markers[(rightAngleIdx + 1) % 3].center;
+			const Point2f pt2 = markers[(rightAngleIdx + 2) % 3].center;
 
-			int sortedBrIdx = -1;
-			for (int i = 0; i < 4; ++i)
+			const Point2f v1 = pt1 - tlCand;
+			const Point2f v2 = pt2 - tlCand;
+			const double  len1 = norm(v1);
+			const double  len2 = norm(v2);
+
+			// Validate near-right-angle geometry.
+			const double legRatio = len1 / std::max(len2, 1.0);
+			if (legRatio < 0.4 || legRatio > 2.5) return false;
+			const double cosTheta = (v1.x * v2.x + v1.y * v2.y) / std::max(len1 * len2, 1.0);
+			if (std::abs(cosTheta) > 0.75) return false;
+
+			// Cross product determines which leg is TR and which is BL.
+			const double cross = v1.x * v2.y - v1.y * v2.x;
+			Point2f trCand, blCand;
+			if (cross > 0) { trCand = pt1; blCand = pt2; }
+			else { trCand = pt2; blCand = pt1; }
+
+			// BR: use the detected 4th marker if close to the parallelogram prediction,
+			// otherwise estimate it.
+			Point2f brCand = trCand + blCand - tlCand;
+			const double maxLeg = std::max(len1, len2);
+			if (markers.size() > 3)
 			{
-				if (norm(sortedPts[i] - brPoint) < kPointMatchTolerance)
+				double minD = 1e9;
+				int    bestIdx = -1;
+				for (size_t i = 3; i < markers.size(); ++i)
 				{
-					sortedBrIdx = i;
-					break;
+					const double d = norm(markers[i].center - brCand);
+					if (d < minD) { minD = d; bestIdx = static_cast<int>(i); }
 				}
+				if (bestIdx >= 0 && minD < maxLeg * 0.4)
+					brCand = markers[bestIdx].center;
 			}
-			if (sortedBrIdx < 0) return false;
 
-			br = sortedPts[sortedBrIdx];
-			bl = sortedPts[(sortedBrIdx + 1) % 4];
-			tl = sortedPts[(sortedBrIdx + 2) % 4];
-			tr = sortedPts[(sortedBrIdx + 3) % 4];
+			tl = tlCand;
+			tr = trCand;
+			br = brCand;
+			bl = blCand;
 			return true;
 		}
 	}
