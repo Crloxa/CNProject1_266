@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <vector>
 
 namespace ImgParse
@@ -25,6 +26,7 @@ namespace ImgParse
 		constexpr int kLocateAdaptiveBlockSize = 101;
 		constexpr int kLocateAdaptiveC = 15;
 		constexpr int kLocateMorphKernel = 2;
+		constexpr double kDistanceEpsilon = 1e-6;
 		// Perspective correction fractions from warp_engine.cpp.
 		constexpr float kPadFraction = 0.05225f;
 		constexpr float kCorrectFraction = 0.0160f;
@@ -181,11 +183,11 @@ namespace ImgParse
 			exactCenter *= 0.25f;
 
 			int brIdx = -1;
-			double minRatio = 1e18;
+			double minRatio = std::numeric_limits<double>::max();
 			for (int i = 0; i < 4; ++i)
 			{
 				const double dist = norm(markers[i].center - exactCenter);
-				if (dist < 1e-6) continue;
+				if (dist < kDistanceEpsilon) continue;
 				const double ratio = markers[i].area / (dist * dist);
 				if (ratio < minRatio)
 				{
