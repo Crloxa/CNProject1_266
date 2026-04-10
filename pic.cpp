@@ -21,6 +21,10 @@ namespace ImgParse
 		constexpr double kMinMarkerMomentArea = 500.0;
 		constexpr double kMarkerMergeDistance = 100.0;
 		constexpr float kPointMatchTolerance = 1.0f;
+		constexpr float kMaxScaledDimension = 800.0f;
+		constexpr int kLocateAdaptiveBlockSize = 101;
+		constexpr int kLocateAdaptiveC = 15;
+		constexpr int kLocateMorphKernel = 2;
 		// Perspective correction fractions from warp_engine.cpp.
 		constexpr float kPadFraction = 0.05225f;
 		constexpr float kCorrectFraction = 0.0160f;
@@ -88,7 +92,7 @@ namespace ImgParse
 			if (srcImg.empty()) return false;
 			Mat gray;
 			if (srcImg.channels() == 3) cvtColor(srcImg, gray, COLOR_BGR2GRAY);
-			else                        gray = srcImg;
+			else                        gray = srcImg.clone();
 
 			if (useHSV && srcImg.channels() == 3)
 			{
@@ -101,16 +105,16 @@ namespace ImgParse
 				gray.setTo(255, satMask);
 			}
 
-			float scale = 800.0f / static_cast<float>(std::max(srcImg.cols, srcImg.rows));
+			float scale = kMaxScaledDimension / static_cast<float>(std::max(srcImg.cols, srcImg.rows));
 			if (scale > 1.0f) scale = 1.0f;
 			Mat smallImg;
 			resize(gray, smallImg, Size(), scale, scale, INTER_AREA);
 
 			Mat binary;
 			adaptiveThreshold(smallImg, binary, 255,
-				ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY_INV, 101, 15);
+				ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY_INV, kLocateAdaptiveBlockSize, kLocateAdaptiveC);
 
-			Mat kernel = getStructuringElement(MORPH_CROSS, Size(2, 2));
+			Mat kernel = getStructuringElement(MORPH_CROSS, Size(kLocateMorphKernel, kLocateMorphKernel));
 			Mat closedBinary;
 			morphologyEx(binary, closedBinary, MORPH_CLOSE, kernel);
 
