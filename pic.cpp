@@ -17,6 +17,13 @@ namespace ImgParse
 		constexpr int   kClaheGridSize = 8;
 		// Light denoise before global threshold to suppress isolated sensor noise.
 		constexpr int   kMedianKernel = 3;
+		// Marker extraction and corner ordering thresholds from warp_engine.cpp.
+		constexpr double kMinMarkerMomentArea = 500.0;
+		constexpr double kMarkerMergeDistance = 100.0;
+		constexpr float kPointMatchTolerance = 1.0f;
+		// Perspective correction fractions from warp_engine.cpp.
+		constexpr float kPadFraction = 0.05225f;
+		constexpr float kCorrectFraction = 0.0160f;
 
 		struct Marker
 		{
@@ -124,7 +131,7 @@ namespace ImgParse
 				}
 				if (depth < 2) continue;
 				const Moments mu = moments(contours[i], false);
-				if (mu.m00 < 500.0) continue;
+				if (mu.m00 < kMinMarkerMomentArea) continue;
 				markers.push_back({
 					Point2f(static_cast<float>(mu.m10 / mu.m00 / scale),
 							static_cast<float>(mu.m01 / mu.m00 / scale)),
@@ -139,7 +146,7 @@ namespace ImgParse
 				bool dup = false;
 				for (auto& u : unique)
 				{
-					if (norm(m.center - u.center) < 100.0)
+					if (norm(m.center - u.center) < kMarkerMergeDistance)
 					{
 						if (m.area > u.area) u = m;
 						dup = true;
@@ -194,7 +201,7 @@ namespace ImgParse
 			int sortedBrIdx = -1;
 			for (int i = 0; i < 4; ++i)
 			{
-				if (norm(sortedPts[i] - brPoint) < 1.0f)
+				if (norm(sortedPts[i] - brPoint) < kPointMatchTolerance)
 				{
 					sortedBrIdx = i;
 					break;
@@ -276,9 +283,9 @@ namespace ImgParse
 
 			// Build perspective transform using the corrected dst points (per warp_engine.cpp convention).
 			const vector<Point2f> srcPts = { tl, tr, br, bl };
-			const float padX = kFrameSize * 0.05225f;
-			const float padY = kFrameSize * 0.05225f;
-			const float correct = kFrameSize * 0.0160f;
+			const float padX = kFrameSize * kPadFraction;
+			const float padY = kFrameSize * kPadFraction;
+			const float correct = kFrameSize * kCorrectFraction;
 			const vector<Point2f> dstPts = {
 				Point2f(padX, padY),
 				Point2f(kFrameSize - 1.0f - padX, padY),
