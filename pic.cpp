@@ -56,6 +56,8 @@ namespace ImgParse
 			medianBlur(contrast, denoise, kMedianKernel);
 
 			Mat binRaw;
+			// Convert to a binary-like decode frame (266x266 BGR) with light local
+			// contrast enhancement and denoise before Otsu thresholding.
 			threshold(denoise, binRaw, 0, 255, THRESH_BINARY | THRESH_OTSU);
 			if (binRaw.empty()) return false;
 			if (binRaw.rows != kFrameSize || binRaw.cols != kFrameSize) return false;
@@ -267,6 +269,7 @@ namespace ImgParse
 		auto warpColor = [&](const Mat& M) -> bool
 			{
 				Mat warped;
+				// Keep module boundaries crisp for downstream binary sampling.
 				warpPerspective(srcImg, warped, M, Size(kFrameSize, kFrameSize), INTER_NEAREST);
 				return buildBinaryOutput(warped, disImg);
 			};
